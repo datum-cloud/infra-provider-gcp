@@ -1,0 +1,38 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts
+  - workloaddeployments
+  - workloads
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts/finalizers
+  - workloaddeployments/finalizers
+  - workloads/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts/status
+  - workloaddeployments/status
+  - workloads/status
+  verbs:
+  - get
+  - patch
+  - update
