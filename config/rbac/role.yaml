@@ -5,11 +5,9 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - compute.datumapis.com
+  - compute.cnrm.cloud.google.com
   resources:
-  - networkcontexts
-  - workloaddeployments
-  - workloads
+  - computenetworks
   verbs:
   - create
   - delete
@@ -19,19 +17,29 @@ rules:
   - update
   - watch
 - apiGroups:
+  - compute.cnrm.cloud.google.com
+  resources:
+  - computenetworks/status
+  verbs:
+  - get
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - compute.datumapis.com
   resources:
   - networkcontexts/finalizers
-  - workloaddeployments/finalizers
-  - workloads/finalizers
   verbs:
   - update
 - apiGroups:
   - compute.datumapis.com
   resources:
   - networkcontexts/status
-  - workloaddeployments/status
-  - workloads/status
   verbs:
   - get
   - patch
