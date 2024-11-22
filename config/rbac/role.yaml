@@ -7,7 +7,11 @@ rules:
 - apiGroups:
   - compute.cnrm.cloud.google.com
   resources:
+  - computefirewalls
+  - computeinstancegroupmanagers
+  - computeinstancetemplates
   - computenetworks
+  - computesubnetworks
   verbs:
   - create
   - delete
@@ -19,7 +23,11 @@ rules:
 - apiGroups:
   - compute.cnrm.cloud.google.com
   resources:
+  - computefirewalls/status
+  - computeinstancegroupmanagers/status
+  - computeinstancetemplates/status
   - computenetworks/status
+  - computesubnetworks/status
   verbs:
   - get
 - apiGroups:
@@ -34,13 +42,67 @@ rules:
   - compute.datumapis.com
   resources:
   - networkcontexts/finalizers
+  - workloaddeployments/finalizers
   verbs:
   - update
 - apiGroups:
   - compute.datumapis.com
   resources:
   - networkcontexts/status
+  - workloaddeployments/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - workloaddeployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - iam.cnrm.cloud.google.com
+  resources:
+  - iampolicies
+  - iamserviceaccounts
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - iam.cnrm.cloud.google.com
+  resources:
+  - iampolicies/status
+  - iamserviceaccounts/status
+  verbs:
+  - get
+- apiGroups:
+  - secretmanager.cnrm.cloud.google.com
+  resources:
+  - secretmanagersecrets
+  - secretmanagersecretversions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - secretmanager.cnrm.cloud.google.com
+  resources:
+  - secretmanagersecrets/status
+  - secretmanagersecretversions/status
+  verbs:
+  - get
