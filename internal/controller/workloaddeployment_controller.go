@@ -365,10 +365,6 @@ func (r *WorkloadDeploymentReconciler) reconcileSandboxRuntimeDeployment(
 						Name:      fmt.Sprintf("disk-%s", attachment.Name),
 						MountPath: *attachment.MountPath,
 					})
-
-					// TODO(jreese) implement this
-					logger.Info("mount path attachments for disk volumes are not currently supported")
-					return ctrl.Result{}, nil
 				}
 
 				if volume.ConfigMap != nil {
@@ -539,9 +535,7 @@ func (r *WorkloadDeploymentReconciler) reconcileVMRuntimeDeployment(
 			volume := volumeMap[attachment.Name]
 
 			if volume.Disk != nil {
-				// TODO(jreese) implement this
-				logger.Info("mount path attachments for disk volumes are not currently supported")
-				return ctrl.Result{}, nil
+				// Currently handed inside `buildInstanceTemplateVolumes`
 			}
 
 			if volume.ConfigMap != nil {
