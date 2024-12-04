@@ -7,11 +7,16 @@ rules:
 - apiGroups:
   - compute.cnrm.cloud.google.com
   resources:
+  - computeaddresses
+  - computebackendservices
   - computefirewalls
+  - computeforwardingrules
+  - computehealthchecks
   - computeinstancegroupmanagers
   - computeinstancetemplates
   - computenetworks
   - computesubnetworks
+  - computetargettcpproxies
   verbs:
   - create
   - delete
@@ -23,13 +28,27 @@ rules:
 - apiGroups:
   - compute.cnrm.cloud.google.com
   resources:
+  - computeaddresses/status
+  - computebackendservices/status
   - computefirewalls/status
+  - computeforwardingrules/status
+  - computehealthchecks/status
+  - computeinstancegroupmanager/status
   - computeinstancegroupmanagers/status
   - computeinstancetemplates/status
   - computenetworks/status
   - computesubnetworks/status
+  - computetargettcpproxies/status
   verbs:
   - get
+- apiGroups:
+  - compute.cnrm.cloud.google.com
+  resources:
+  - computeinstancegroupmanager
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - compute.datumapis.com
   resources:
@@ -43,6 +62,7 @@ rules:
   resources:
   - networkcontexts/finalizers
   - workloaddeployments/finalizers
+  - workloads/finalizers
   verbs:
   - update
 - apiGroups:
@@ -50,6 +70,7 @@ rules:
   resources:
   - networkcontexts/status
   - workloaddeployments/status
+  - workloads/status
   verbs:
   - get
   - patch
@@ -58,6 +79,7 @@ rules:
   - compute.datumapis.com
   resources:
   - workloaddeployments
+  - workloads
   verbs:
   - create
   - delete

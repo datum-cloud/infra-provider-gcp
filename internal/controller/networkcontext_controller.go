@@ -16,8 +16,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
 
@@ -28,8 +31,9 @@ import (
 // ComputeNetwork is created to represent the context within GCP.
 type NetworkContextReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	GCPProject string
+	InfraClient client.Client
+	Scheme      *runtime.Scheme
+	GCPProject  string
 }
 
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=networkcontexts,verbs=get;list;watch
@@ -93,7 +97,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		Namespace: networkContext.Namespace,
 		Name:      kccNetworkName,
 	}
-	if err := r.Client.Get(ctx, kccNetworkObjectKey, &kccNetwork); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, kccNetworkObjectKey, &kccNetwork); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching gcp network: %w", err)
 	}
 
@@ -119,7 +123,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, fmt.Errorf("failed to set controller on firewall: %w", err)
 		}
 
-		if err := r.Client.Create(ctx, &kccNetwork); err != nil {
+		if err := r.InfraClient.Create(ctx, &kccNetwork); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed creating gcp network: %w", err)
 		}
 	}
@@ -139,9 +143,13 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *NetworkContextReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *NetworkContextReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1alpha.NetworkContext{}).
-		Owns(&kcccomputev1beta1.ComputeNetwork{}).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeNetwork{},
+			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeNetwork](mgr.GetScheme(), mgr.GetRESTMapper(), &networkingv1alpha.NetworkContext{}),
+		)).
 		Complete(r)
 }

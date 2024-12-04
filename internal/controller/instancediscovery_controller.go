@@ -23,9 +23,12 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
@@ -35,8 +38,9 @@ import (
 // gateways defined.
 type InstanceDiscoveryReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	GCPProject string
+	InfraClient client.Client
+	Scheme      *runtime.Scheme
+	GCPProject  string
 
 	finalizers              finalizer.Finalizers
 	instancesClient         *gcpcomputev1.InstancesClient
@@ -57,7 +61,7 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	var instanceGroupManager unstructured.Unstructured
 	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instanceGroupManager); err != nil {
+	if err := r.InfraClient.Get(ctx, req.NamespacedName, &instanceGroupManager); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -74,7 +78,7 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 	}
 	if finalizationResult.Updated {
-		if err = r.Client.Update(ctx, &instanceGroupManager); err != nil {
+		if err = r.InfraClient.Update(ctx, &instanceGroupManager); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update based on finalization result: %w", err)
 		}
 		return ctrl.Result{}, nil
@@ -209,7 +213,7 @@ func (r *InstanceDiscoveryReconciler) Finalize(
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *InstanceDiscoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *InstanceDiscoveryReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
 
 	instancesClient, err := gcpcomputev1.NewInstancesRESTClient(context.Background())
 	if err != nil {
@@ -240,7 +244,12 @@ func (r *InstanceDiscoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&instanceGroupManager).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&instanceGroupManager,
+			&handler.TypedEnqueueRequestForObject[*unstructured.Unstructured]{},
+		)).
+		Named("instancediscovery").
 		Complete(r)
 }
 

@@ -30,12 +30,14 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	k8sjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/util/sets"
-	clusterinventoryv1alpha1 "sigs.k8s.io/cluster-inventory-api/apis/v1alpha1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
@@ -61,8 +63,9 @@ var populateSecretsScript string
 // WorkloadDeploymentReconciler reconciles a WorkloadDeployment object
 type WorkloadDeploymentReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	GCPProject string
+	InfraClient client.Client
+	Scheme      *runtime.Scheme
+	GCPProject  string
 
 	finalizers finalizer.Finalizers
 }
@@ -122,7 +125,7 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// appropriately.
 
 	// Don't do anything if a cluster isn't set
-	if deployment.Status.ClusterProfileRef == nil {
+	if deployment.Status.ClusterRef == nil {
 		return ctrl.Result{}, nil
 	}
 
@@ -137,7 +140,7 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
 	r.finalizers = finalizer.NewFinalizers()
 	if err := r.finalizers.Register(gcpInfraFinalizer, r); err != nil {
 		return fmt.Errorf("failed to register finalizer: %w", err)
@@ -150,12 +153,32 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error 
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&computev1alpha.WorkloadDeployment{}).
-		Owns(&kcccomputev1beta1.ComputeFirewall{}).
-		Owns(&kcccomputev1beta1.ComputeInstanceTemplate{}).
-		Owns(&kcciamv1beta1.IAMServiceAccount{}).
-		Owns(&instanceGroupManager).
 		Owns(&networkingv1alpha.NetworkBinding{}).
-		Owns(&kccsecretmanagerv1beta1.SecretManagerSecret{}).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeFirewall{},
+			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeFirewall](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.WorkloadDeployment{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeInstanceTemplate{},
+			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeInstanceTemplate](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.WorkloadDeployment{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcciamv1beta1.IAMServiceAccount{},
+			handler.TypedEnqueueRequestForOwner[*kcciamv1beta1.IAMServiceAccount](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.WorkloadDeployment{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&instanceGroupManager,
+			handler.TypedEnqueueRequestForOwner[*unstructured.Unstructured](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.WorkloadDeployment{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kccsecretmanagerv1beta1.SecretManagerSecret{},
+			handler.TypedEnqueueRequestForOwner[*kccsecretmanagerv1beta1.SecretManagerSecret](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.WorkloadDeployment{}),
+		)).
 		Complete(r)
 }
 
@@ -167,28 +190,22 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 	instanceMetadata []kcccomputev1beta1.InstancetemplateMetadata,
 ) (res ctrl.Result, err error) {
 
-	var clusterProfile clusterinventoryv1alpha1.ClusterProfile
-	clusterProfileObjectKey := client.ObjectKey{
-		Namespace: deployment.Status.ClusterProfileRef.Namespace,
-		Name:      deployment.Status.ClusterProfileRef.Name,
+	var cluster networkingv1alpha.DatumCluster
+	clusterObjectKey := client.ObjectKey{
+		Namespace: deployment.Status.ClusterRef.Namespace,
+		Name:      deployment.Status.ClusterRef.Name,
 	}
-	if err := r.Client.Get(ctx, clusterProfileObjectKey, &clusterProfile); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed fetching cluster profile: %w", err)
+	if err := r.Client.Get(ctx, clusterObjectKey, &cluster); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching cluster: %w", err)
+	}
+
+	if cluster.Spec.Provider.GCP == nil {
+		return ctrl.Result{}, fmt.Errorf("attached cluster is not for the GCP provider")
 	}
 
 	// var gcpProject string
-	var gcpRegion string
-	var gcpZone string
-	for _, property := range clusterProfile.Status.Properties {
-		switch property.Name {
-		// case ClusterPropertyProject:
-		// 	gcpProject = property.Value
-		case ClusterPropertyRegion:
-			gcpRegion = property.Value
-		case ClusterPropertyZone:
-			gcpZone = property.Value
-		}
-	}
+	gcpRegion := cluster.Spec.Provider.GCP.Region
+	gcpZone := cluster.Spec.Provider.GCP.Zone
 
 	// if len(gcpProject) == 0 {
 	// 	return ctrl.Result{}, fmt.Errorf("failed to locate value for cluster property %s", ClusterPropertyProject)
@@ -235,7 +252,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		Namespace: deployment.Namespace,
 		Name:      fmt.Sprintf("workload-%d", h.Sum32()),
 	}
-	if err := r.Client.Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching deployment's service account: %w", err)
 	}
 
@@ -257,7 +274,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 			return ctrl.Result{}, fmt.Errorf("failed to set controller on service account: %w", err)
 		}
 
-		if err := r.Client.Create(ctx, &serviceAccount); err != nil {
+		if err := r.InfraClient.Create(ctx, &serviceAccount); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create deployment's service account: %w", err)
 		}
 	}
@@ -305,7 +322,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 
 	if !oldInstanceTemplate.CreationTimestamp.IsZero() {
 		logger.Info("deleting old instance template")
-		if err := r.Client.Delete(ctx, oldInstanceTemplate); err != nil {
+		if err := r.InfraClient.Delete(ctx, oldInstanceTemplate); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to delete instance instance template: %w", err)
 		}
 
@@ -605,8 +622,7 @@ func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 		}
 
 		if networkBinding.Status.NetworkContextRef == nil {
-			logger.Info("network binding not associated with network context", "network_binding_name", networkBinding.Name)
-			return nil
+			return fmt.Errorf("network binding not associated with network context")
 		}
 
 		var networkContext networkingv1alpha.NetworkContext
@@ -632,7 +648,7 @@ func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 				Name:      firewallName,
 			}
 
-			if err := r.Client.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
+			if err := r.InfraClient.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
 				return fmt.Errorf("failed to read firewall from k8s API: %w", err)
 			}
 
@@ -706,7 +722,7 @@ func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 					}
 				}
 
-				if err := r.Client.Create(ctx, &firewall); err != nil {
+				if err := r.InfraClient.Create(ctx, &firewall); err != nil {
 					return fmt.Errorf("failed to create firewall: %w", err)
 				}
 			}
@@ -764,10 +780,10 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 ) (bool, error) {
 	var objectKeys []client.ObjectKey
 	for _, volume := range deployment.Spec.Template.Spec.Volumes {
-		if volume.ConfigMap != nil {
+		if volume.Secret != nil {
 			objectKeys = append(objectKeys, client.ObjectKey{
 				Namespace: deployment.Namespace,
-				Name:      volume.ConfigMap.Name,
+				Name:      volume.Secret.SecretName,
 			})
 		}
 	}
@@ -802,7 +818,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 			Name:      fmt.Sprintf("deployment-%s", deployment.UID),
 		},
 	}
-	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, aggregatedK8sSecret, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, r.InfraClient, aggregatedK8sSecret, func() error {
 		if aggregatedK8sSecret.CreationTimestamp.IsZero() {
 			if err := controllerutil.SetControllerReference(deployment, aggregatedK8sSecret, r.Scheme); err != nil {
 				return fmt.Errorf("failed to set controller on aggregated deployment secret: %w", err)
@@ -827,7 +843,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 		Namespace: deployment.Namespace,
 		Name:      fmt.Sprintf("deployment-%s", deployment.UID),
 	}
-	if err := r.Client.Get(ctx, secretObjectKey, &secret); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, secretObjectKey, &secret); client.IgnoreNotFound(err) != nil {
 		return false, fmt.Errorf("failed fetching deployment secret: %w", err)
 	}
 
@@ -851,7 +867,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 			return false, fmt.Errorf("failed to set controller on deployment secret manager secret: %w", err)
 		}
 
-		if err := r.Client.Create(ctx, &secret); err != nil {
+		if err := r.InfraClient.Create(ctx, &secret); err != nil {
 			return false, fmt.Errorf("failed to create deployment secret: %w", err)
 		}
 	}
@@ -863,7 +879,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 	}
 
 	var secretIAMPolicy kcciamv1beta1.IAMPolicy
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(&secret), &secretIAMPolicy); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, client.ObjectKeyFromObject(&secret), &secretIAMPolicy); client.IgnoreNotFound(err) != nil {
 		return false, fmt.Errorf("failed fetching secret's IAM policy: %w", err)
 	}
 
@@ -897,7 +913,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 			return false, fmt.Errorf("failed to set controller on deployment secret IAM policy: %w", err)
 		}
 
-		if err := r.Client.Create(ctx, &secretIAMPolicy); err != nil {
+		if err := r.InfraClient.Create(ctx, &secretIAMPolicy); err != nil {
 			return false, fmt.Errorf("failed setting IAM policy on secret: %w", err)
 		}
 	}
@@ -906,7 +922,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 	// TODO(jreese) handle updates to secrets - use Generation from aggregated
 	// secret manifest?
 	var secretVersion kccsecretmanagerv1beta1.SecretManagerSecretVersion
-	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(&secret), &secretVersion); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, client.ObjectKeyFromObject(&secret), &secretVersion); client.IgnoreNotFound(err) != nil {
 		return false, fmt.Errorf("failed fetching secret manager version: %w", err)
 	}
 
@@ -941,7 +957,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 			return false, fmt.Errorf("failed to set controller on secret version: %w", err)
 		}
 
-		if err := r.Client.Create(ctx, &secretVersion); err != nil {
+		if err := r.InfraClient.Create(ctx, &secretVersion); err != nil {
 			return false, fmt.Errorf("failed to create secret version: %w", err)
 		}
 	}
@@ -977,7 +993,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 	var oldInstanceTemplate kcccomputev1beta1.ComputeInstanceTemplate
 
 	var instanceTemplates kcccomputev1beta1.ComputeInstanceTemplateList
-	if err := r.Client.List(
+	if err := r.InfraClient.List(
 		ctx,
 		&instanceTemplates,
 		client.MatchingLabels{
@@ -1055,6 +1071,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 		if err != nil {
 			return ctrl.Result{}, nil, nil, fmt.Errorf("failed to build instance template network interfaces: %w", err)
 		} else if !result.IsZero() {
+			logger.Info("network environment is not ready to attach")
 			return result, nil, nil, nil
 		}
 
@@ -1063,7 +1080,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 		}
 
 		logger.Info("creating instance template for workload")
-		if err := r.Client.Create(ctx, &instanceTemplate); err != nil {
+		if err := r.InfraClient.Create(ctx, &instanceTemplate); err != nil {
 			return ctrl.Result{}, nil, nil, fmt.Errorf("failed to create instance template: %w", err)
 		}
 
@@ -1196,8 +1213,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 		}
 
 		if networkBinding.Status.NetworkContextRef == nil {
-			logger.Info("network binding not associated with network context", "network_binding_name", networkBinding.Name)
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, fmt.Errorf("network binding not associated with network context")
 		}
 
 		var networkContext networkingv1alpha.NetworkContext
@@ -1247,6 +1263,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 				},
 				Spec: networkingv1alpha.SubnetClaimSpec{
 					SubnetClass: "private",
+					IPFamily:    networkingv1alpha.IPv4Protocol,
 					NetworkContext: networkingv1alpha.LocalNetworkContextRef{
 						Name: networkContext.Name,
 					},
@@ -1286,8 +1303,11 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 		}
 
 		var kccSubnet kcccomputev1beta1.ComputeSubnetwork
-		kccSubnetObjectKey := subnetObjectKey
-		if err := r.Client.Get(ctx, kccSubnetObjectKey, &kccSubnet); client.IgnoreNotFound(err) != nil {
+		kccSubnetObjectKey := client.ObjectKey{
+			Namespace: subnetClaim.Namespace,
+			Name:      fmt.Sprintf("%s-%s", networkContext.Name, subnetClaim.Status.SubnetRef.Name),
+		}
+		if err := r.InfraClient.Get(ctx, kccSubnetObjectKey, &kccSubnet); client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, fmt.Errorf("failed fetching GCP subnetwork: %w", err)
 		}
 
@@ -1317,7 +1337,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 				return ctrl.Result{}, fmt.Errorf("failed to set controller on GCP subnetwork: %w", err)
 			}
 
-			if err := r.Client.Create(ctx, &kccSubnet); err != nil {
+			if err := r.InfraClient.Create(ctx, &kccSubnet); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed creating GCP subnetwork: %w", err)
 			}
 		}
@@ -1372,7 +1392,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceGroupManager(
 		Namespace: deployment.Namespace,
 		Name:      instanceGroupManagerName,
 	}
-	if err := r.Client.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); client.IgnoreNotFound(err) != nil {
 		return nil, fmt.Errorf("failed fetching instance group manager: %w", err)
 	}
 
@@ -1447,7 +1467,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceGroupManager(
 			Object: unstructuredInstanceGroupManager,
 		}
 		u.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
-		if err := r.Client.Create(ctx, u); err != nil {
+		if err := r.InfraClient.Create(ctx, u); err != nil {
 			return nil, fmt.Errorf("failed to create instance group manager: %w", err)
 		}
 
@@ -1468,7 +1488,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceGroupManager(
 				return nil, fmt.Errorf("failed setting instance template ref name: %w", err)
 			}
 
-			if err := r.Client.Update(ctx, &instanceGroupManager); err != nil {
+			if err := r.InfraClient.Update(ctx, &instanceGroupManager); err != nil {
 				return nil, fmt.Errorf("failed updating instance template for instance group manager: %w", err)
 			}
 		}
@@ -1553,7 +1573,7 @@ func (r *WorkloadDeploymentReconciler) updateDeploymentStatus(
 				groupManagerLabels[timestampLabel] = strconv.FormatInt(metav1.Now().Unix(), 10)
 				logger.Info("updating reconciler timestamp label on instance group manager")
 				instanceGroupManager.SetLabels(groupManagerLabels)
-				if err := r.Client.Update(ctx, instanceGroupManager); err != nil {
+				if err := r.InfraClient.Update(ctx, instanceGroupManager); err != nil {
 					return ctrl.Result{}, fmt.Errorf("failed updating instance group manager to update label: %w", err)
 				}
 			}
@@ -1612,20 +1632,20 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 		Namespace: deployment.Namespace,
 		Name:      instanceGroupManagerName,
 	}
-	if err := r.Client.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); client.IgnoreNotFound(err) != nil {
 		return finalizer.Result{}, fmt.Errorf("failed fetching  instance group manager: %w", err)
 	}
 
 	if t := instanceGroupManager.GetCreationTimestamp(); !t.IsZero() {
 		if dt := instanceGroupManager.GetDeletionTimestamp(); dt.IsZero() {
-			if err := r.Client.Delete(ctx, &instanceGroupManager); err != nil {
+			if err := r.InfraClient.Delete(ctx, &instanceGroupManager); err != nil {
 				return finalizer.Result{}, fmt.Errorf("failed deleting instance group manager: %w", err)
 			}
 		}
 	}
 
 	var instanceTemplates kcccomputev1beta1.ComputeInstanceTemplateList
-	if err := r.Client.List(
+	if err := r.InfraClient.List(
 		ctx,
 		&instanceTemplates,
 		client.MatchingLabels{
@@ -1636,7 +1656,7 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 	}
 
 	for _, instanceTemplate := range instanceTemplates.Items {
-		if err := r.Client.Delete(ctx, &instanceTemplate); err != nil {
+		if err := r.InfraClient.Delete(ctx, &instanceTemplate); err != nil {
 			return finalizer.Result{}, fmt.Errorf("failed to delete instance template: %w", err)
 		}
 	}
