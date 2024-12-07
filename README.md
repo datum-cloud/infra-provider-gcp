@@ -1,5 +1,10 @@
 # Datum GCP Infrastructure Provider
 
+> [!CAUTION]
+> This operator is currently in a POC phase. The POC integration branch will
+> be orphaned and separate PRs opened for discrete components (APIs, controllers,
+> etc) as they mature.
+
 This provider interprets workload related entities and provisions resources to
 satisfy workload requirements in GCP.
 
