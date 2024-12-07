@@ -3,10 +3,12 @@ package cloudinit
 import "gopkg.in/yaml.v3"
 
 type CloudConfig struct {
-	RunCmd     []string    `yaml:"runcmd,omitempty"`
-	WriteFiles []WriteFile `yaml:"write_files,omitempty"`
-	FSSetup    []FSSetup   `yaml:"fs_setup,omitempty"`
-	Mounts     []string    `yaml:"mounts,omitempty"`
+	Hostname         string      `yaml:"hostname,omitempty"`
+	PreserveHostname *bool       `yaml:"preserve_hostname,omitempty"`
+	RunCmd           []string    `yaml:"runcmd,omitempty"`
+	WriteFiles       []WriteFile `yaml:"write_files,omitempty"`
+	FSSetup          []FSSetup   `yaml:"fs_setup,omitempty"`
+	Mounts           []string    `yaml:"mounts,omitempty"`
 }
 
 func (c CloudConfig) Generate() ([]byte, error) {

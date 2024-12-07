@@ -23,11 +23,15 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
+	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
@@ -35,8 +39,8 @@ import (
 // gateways defined.
 type InstanceDiscoveryReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	GCPProject string
+	InfraClient client.Client
+	Scheme      *runtime.Scheme
 
 	finalizers              finalizer.Finalizers
 	instancesClient         *gcpcomputev1.InstancesClient
@@ -57,7 +61,7 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	var instanceGroupManager unstructured.Unstructured
 	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instanceGroupManager); err != nil {
+	if err := r.InfraClient.Get(ctx, req.NamespacedName, &instanceGroupManager); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -74,7 +78,7 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 	}
 	if finalizationResult.Updated {
-		if err = r.Client.Update(ctx, &instanceGroupManager); err != nil {
+		if err = r.InfraClient.Update(ctx, &instanceGroupManager); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update based on finalization result: %w", err)
 		}
 		return ctrl.Result{}, nil
@@ -105,11 +109,18 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	var workloadDeployment computev1alpha.WorkloadDeployment
 	if !isDeleting {
-		w, err := r.getWorkloadDeploymentForInstanceGroupManager(ctx, req.Namespace, instanceGroupManager.GetOwnerReferences())
+		w, err := r.getWorkloadDeploymentForInstanceGroupManager(ctx, instanceGroupManager)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed fetching workload deployment: %w", err)
 		}
 		workloadDeployment = *w
+	}
+
+	gcpProject, ok, err := unstructured.NestedString(instanceGroupManager.Object, "spec", "projectRef", "external")
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed reading project from instance group manager: %w", err)
+	} else if !ok {
+		return ctrl.Result{}, fmt.Errorf("empty project found on instance group manager")
 	}
 
 	gcpZone, ok, err := unstructured.NestedString(instanceGroupManager.Object, "spec", "location")
@@ -130,7 +141,7 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// we do that, we'll want to make sure to set the `abandon` annotation value.
 
 	listRequest := &computepb.ListManagedInstancesInstanceGroupManagersRequest{
-		Project:              r.GCPProject,
+		Project:              gcpProject,
 		Zone:                 gcpZone,
 		InstanceGroupManager: req.Name,
 	}
@@ -147,10 +158,10 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		result, err := r.reconcileDatumInstance(
 			ctx,
 			logger,
+			gcpProject,
 			gcpZone,
 			isDeleting,
 			&workloadDeployment,
-			instanceGroupManager,
 			managedInstance,
 		)
 		if err != nil {
@@ -172,90 +183,37 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 func (r *InstanceDiscoveryReconciler) getWorkloadDeploymentForInstanceGroupManager(
 	ctx context.Context,
-	namespace string,
-	ownerReferences []metav1.OwnerReference,
+	instanceGroupManager unstructured.Unstructured,
 ) (*computev1alpha.WorkloadDeployment, error) {
+	labels := instanceGroupManager.GetLabels()
 	var workloadDeployment computev1alpha.WorkloadDeployment
-	ownerFound := false
-	for _, ownerRef := range ownerReferences {
-		if ownerRef.Kind == "WorkloadDeployment" {
-			workloadDeploymentObjectKey := client.ObjectKey{
-				Namespace: namespace,
-				Name:      ownerRef.Name,
-			}
-			if err := r.Client.Get(ctx, workloadDeploymentObjectKey, &workloadDeployment); err != nil {
-				return nil, fmt.Errorf("failed to get workload deployment: %w", err)
-			}
-			ownerFound = true
-			break
-		}
+	if labels[crossclusterutil.UpstreamOwnerKindLabel] != "WorkloadDeployment" {
+		return nil, fmt.Errorf("failed to find WorkloadDeployment owner for ComputeInstanceGroupManager")
 	}
 
-	if !ownerFound {
-		return nil, fmt.Errorf("failed to find WorkloadDeployment owner for ComputeInstanceGroupManager")
+	workloadDeploymentObjectKey := client.ObjectKey{
+		Namespace: labels[crossclusterutil.UpstreamOwnerNamespaceLabel],
+		Name:      labels[crossclusterutil.UpstreamOwnerNameLabel],
+	}
+	if err := r.Client.Get(ctx, workloadDeploymentObjectKey, &workloadDeployment); err != nil {
+		return nil, fmt.Errorf("failed to get workload deployment: %w", err)
 	}
 
 	return &workloadDeployment, nil
 }
 
-func (r *InstanceDiscoveryReconciler) Finalize(
-	ctx context.Context,
-	obj client.Object,
-) (finalizer.Result, error) {
-
-	// TODO(jreese) ensure all instances are deleted
-
-	return finalizer.Result{}, nil
-}
-
-// SetupWithManager sets up the controller with the Manager.
-func (r *InstanceDiscoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
-
-	instancesClient, err := gcpcomputev1.NewInstancesRESTClient(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to create instance group managers client: %w", err)
-	}
-	r.instancesClient = instancesClient
-
-	instanceTemplatesClient, err := gcpcomputev1.NewInstanceTemplatesRESTClient(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to create instance group managers client: %w", err)
-	}
-	r.instanceTemplatesClient = instanceTemplatesClient
-
-	instanceGroupManagersClient, err := gcpcomputev1.NewInstanceGroupManagersRESTClient(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to create instance group managers client: %w", err)
-	}
-	r.migClient = instanceGroupManagersClient
-
-	r.finalizers = finalizer.NewFinalizers()
-	if err := r.finalizers.Register(gcpWorkloadFinalizer, r); err != nil {
-		return fmt.Errorf("failed to register finalizer: %w", err)
-	}
-
-	// Watch the unstructured form of an instance group manager, as the generated
-	// types are not aligned with the actual CRD.
-	var instanceGroupManager unstructured.Unstructured
-	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
-
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&instanceGroupManager).
-		Complete(r)
-}
-
 func (r *InstanceDiscoveryReconciler) reconcileDatumInstance(
 	ctx context.Context,
 	logger logr.Logger,
+	gcpProject string,
 	gcpZone string,
 	isDeleting bool,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
-	instanceGroupManager unstructured.Unstructured,
 	managedInstance *computepb.ManagedInstance,
 ) (ctrl.Result, error) {
 
 	getInstanceReq := &computepb.GetInstanceRequest{
-		Project:  r.GCPProject,
+		Project:  gcpProject,
 		Zone:     gcpZone,
 		Instance: *managedInstance.Name,
 	}
@@ -272,7 +230,7 @@ func (r *InstanceDiscoveryReconciler) reconcileDatumInstance(
 
 	datumInstance := &computev1alpha.Instance{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: instanceGroupManager.GetNamespace(),
+			Namespace: workloadDeployment.Namespace,
 			Name:      *managedInstance.Name,
 		},
 	}
@@ -285,11 +243,8 @@ func (r *InstanceDiscoveryReconciler) reconcileDatumInstance(
 				logger.Info("updating datum instance")
 			}
 
-			// TODO(jreese) move controller owner to workload deployment when
-			// it or the instance itself has a finalizer that will allow for
-			// more accurate status to be shown during teardowns.
-			if err := controllerutil.SetControllerReference(&instanceGroupManager, datumInstance, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on backend service: %w", err)
+			if err := controllerutil.SetControllerReference(workloadDeployment, datumInstance, r.Scheme); err != nil {
+				return fmt.Errorf("failed to set controller on instance: %w", err)
 			}
 
 			// TODO(jreese) track a workload deployment revision that aligns with the
@@ -385,6 +340,55 @@ func (r *InstanceDiscoveryReconciler) reconcileDatumInstance(
 		}
 	}
 	return reconcileResult, nil
+}
+
+func (r *InstanceDiscoveryReconciler) Finalize(
+	ctx context.Context,
+	obj client.Object,
+) (finalizer.Result, error) {
+
+	return finalizer.Result{}, nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *InstanceDiscoveryReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
+
+	instancesClient, err := gcpcomputev1.NewInstancesRESTClient(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to create instance group managers client: %w", err)
+	}
+	r.instancesClient = instancesClient
+
+	instanceTemplatesClient, err := gcpcomputev1.NewInstanceTemplatesRESTClient(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to create instance group managers client: %w", err)
+	}
+	r.instanceTemplatesClient = instanceTemplatesClient
+
+	instanceGroupManagersClient, err := gcpcomputev1.NewInstanceGroupManagersRESTClient(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to create instance group managers client: %w", err)
+	}
+	r.migClient = instanceGroupManagersClient
+
+	r.finalizers = finalizer.NewFinalizers()
+	if err := r.finalizers.Register(gcpWorkloadFinalizer, r); err != nil {
+		return fmt.Errorf("failed to register finalizer: %w", err)
+	}
+
+	// Watch the unstructured form of an instance group manager, as the generated
+	// types are not aligned with the actual CRD.
+	var instanceGroupManager unstructured.Unstructured
+	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
+
+	return ctrl.NewControllerManagedBy(mgr).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&instanceGroupManager,
+			&handler.TypedEnqueueRequestForObject[*unstructured.Unstructured]{},
+		)).
+		Named("instancediscovery").
+		Complete(r)
 }
 
 func extractUnstructuredConditions(

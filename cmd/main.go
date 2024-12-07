@@ -10,16 +10,25 @@ import (
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	"k8s.io/client-go/tools/clientcmd"
 
+	kcccomputev1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/compute/v1beta1"
+	kcciamv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/iam/v1beta1"
+	kccsecretmanagerv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/secretmanager/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"go.datum.net/infra-provider-gcp/internal/controller"
+	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
+	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -30,6 +39,14 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(computev1alpha.AddToScheme(scheme))
+	utilruntime.Must(networkingv1alpha.AddToScheme(scheme))
+
+	utilruntime.Must(kcccomputev1beta1.AddToScheme(scheme))
+	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
+	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
+	utilruntime.Must(kccsecretmanagerv1beta1.AddToScheme(scheme))
+
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -40,6 +57,9 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var gcpProject string
+	var upstreamKubeconfig string
+
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -50,10 +70,20 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+
+	// Ideally the project would come from the ClusterProfile, just need to think of
+	// how to propagate that information for entities that don't have a ClusterProfile
+	// on them, and what to do in cases where entities can't span projects (assuming
+	// that LB backends can't - but haven't checked network endpoint groups)
+	flag.StringVar(&gcpProject, "gcp-project", "", "The GCP project to provision resources in.")
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
+
+	flag.StringVar(&upstreamKubeconfig, "upstream-kubeconfig", "", "absolute path to the kubeconfig "+
+		"file for the API server that is the source of truth for datum entities")
+
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
@@ -101,7 +131,18 @@ func main() {
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	if len(upstreamKubeconfig) == 0 {
+		setupLog.Info("must provide --upstream-kubeconfig")
+		os.Exit(1)
+	}
+
+	upstreamClusterConfig, err := clientcmd.BuildConfigFromFlags("", upstreamKubeconfig)
+	if err != nil {
+		setupLog.Error(err, "unable to load control plane kubeconfig")
+		os.Exit(1)
+	}
+
+	mgr, err := ctrl.NewManager(upstreamClusterConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -122,6 +163,72 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	// We consider the cluster that the operator has been deployed in to be the
+	// target cluster for infrastructure components.
+	infraCluster, err := cluster.New(ctrl.GetConfigOrDie(), func(o *cluster.Options) {
+		o.Scheme = scheme
+	})
+	if err != nil {
+		setupLog.Error(err, "failed to construct cluster")
+		os.Exit(1)
+	}
+
+	if err := mgr.Add(infraCluster); err != nil {
+		setupLog.Error(err, "failed to add cluster to manager")
+		os.Exit(1)
+	}
+
+	if err = (&controller.InfraClusterNamespaceReconciler{
+		Client:      mgr.GetClient(),
+		InfraClient: infraCluster.GetClient(),
+		Scheme:      mgr.GetScheme(),
+	}).SetupWithManager(mgr, infraCluster); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "InfraClusterNamespaceReconciler")
+		os.Exit(1)
+	}
+
+	// TODO(jreese) rework the gateway controller when we have a higher level
+	// orchestrator from network-services-operator that schedules "sub gateways"
+	// onto clusters, similar to Workloads -> WorkloadDeployments and
+	// Networks -> NetworkContexts
+	//
+	// if err = (&controller.WorkloadGatewayReconciler{
+	// 	Client:      mgr.GetClient(),
+	// 	InfraClient: infraCluster.GetClient(),
+	// 	Scheme:      mgr.GetScheme(),
+	// 	GCPProject:  gcpProject,
+	// }).SetupWithManager(mgr, infraCluster); err != nil {
+	// 	setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
+	// 	os.Exit(1)
+	// }
+
+	if err = (&controller.WorkloadDeploymentReconciler{
+		Client:      mgr.GetClient(),
+		InfraClient: infraCluster.GetClient(),
+		Scheme:      mgr.GetScheme(),
+	}).SetupWithManager(mgr, infraCluster); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
+		os.Exit(1)
+	}
+
+	if err = (&controller.InstanceDiscoveryReconciler{
+		Client:      mgr.GetClient(),
+		InfraClient: infraCluster.GetClient(),
+		Scheme:      mgr.GetScheme(),
+	}).SetupWithManager(mgr, infraCluster); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "InstanceDiscoveryReconciler")
+		os.Exit(1)
+	}
+
+	if err = (&controller.NetworkContextReconciler{
+		Client:      mgr.GetClient(),
+		InfraClient: infraCluster.GetClient(),
+		Scheme:      mgr.GetScheme(),
+	}).SetupWithManager(mgr, infraCluster); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
 		os.Exit(1)
 	}
 

@@ -23,12 +23,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
+	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -42,8 +45,9 @@ const deploymentWorkloadUID = "spec.workloadRef.uid"
 // gateways defined.
 type WorkloadGatewayReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	GCPProject string
+	InfraClient client.Client
+	Scheme      *runtime.Scheme
+	GCPProject  string
 
 	finalizers finalizer.Finalizers
 }
@@ -209,7 +213,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayAddress(
 		Namespace: workload.Namespace,
 		Name:      addressName,
 	}
-	if err := r.Client.Get(ctx, addressObjectKey, &address); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, addressObjectKey, &address); client.IgnoreNotFound(err) != nil {
 		return address, fmt.Errorf("failed fetching IP address: %w", err)
 	}
 
@@ -234,11 +238,11 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayAddress(
 			},
 		}
 
-		if err := controllerutil.SetControllerReference(workload, &address, r.Scheme); err != nil {
-			return address, fmt.Errorf("failed to set controller on IP address: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &address, r.Scheme); err != nil {
+			return address, fmt.Errorf("failed failed to set owner on IP address: %w", err)
 		}
 
-		if err := r.Client.Create(ctx, &address); err != nil {
+		if err := r.InfraClient.Create(ctx, &address); err != nil {
 			return address, fmt.Errorf("failed to create IP address: %w", err)
 		}
 	}
@@ -260,7 +264,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayLBFirewall(
 		Name:      firewallName,
 	}
 
-	if err := r.Client.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
+	if err := r.InfraClient.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
 		return firewall, fmt.Errorf("failed fetching firewall rule for LB backends: %w", err)
 	}
 
@@ -273,7 +277,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayLBFirewall(
 			Namespace: workload.Namespace,
 			Name:      primaryNetworkInterface.Network.Name,
 		}
-		if err := r.Client.Get(ctx, primaryNetworkObjectKey, &primaryNetwork); err != nil {
+		if err := r.InfraClient.Get(ctx, primaryNetworkObjectKey, &primaryNetwork); err != nil {
 			return firewall, fmt.Errorf("failed fetching network for primary network interface: %w", err)
 		}
 
@@ -305,8 +309,8 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayLBFirewall(
 			},
 		}
 
-		if err := controllerutil.SetControllerReference(workload, &firewall, r.Scheme); err != nil {
-			return firewall, fmt.Errorf("failed to set controller on firewall: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &firewall, r.Scheme); err != nil {
+			return firewall, fmt.Errorf("failed failed to set owner on firewall: %w", err)
 		}
 
 		for _, namedPort := range backendPorts.UnsortedList() {
@@ -321,7 +325,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayLBFirewall(
 			})
 		}
 
-		if err := r.Client.Create(ctx, &firewall); err != nil {
+		if err := r.InfraClient.Create(ctx, &firewall); err != nil {
 			return firewall, fmt.Errorf("failed to create gateway firewall rule: %w", err)
 		}
 	}
@@ -366,7 +370,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 			Namespace: workload.Namespace,
 			Name:      healthCheckName,
 		}
-		if err := r.Client.Get(ctx, healthCheckObjectKey, &healthCheck); client.IgnoreNotFound(err) != nil {
+		if err := r.InfraClient.Get(ctx, healthCheckObjectKey, &healthCheck); client.IgnoreNotFound(err) != nil {
 			return fmt.Errorf("failed fetching health check: %w", err)
 		}
 
@@ -388,11 +392,11 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 				},
 			}
 
-			if err := controllerutil.SetControllerReference(workload, &healthCheck, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on health check: %w", err)
+			if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &healthCheck, r.Scheme); err != nil {
+				return fmt.Errorf("failed failed to set owner on health check: %w", err)
 			}
 
-			if err := r.Client.Create(ctx, &healthCheck); err != nil {
+			if err := r.InfraClient.Create(ctx, &healthCheck); err != nil {
 				return fmt.Errorf("failed to create health check: %w", err)
 			}
 
@@ -439,7 +443,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 			Name:      targetTCPProxyName,
 		}
 
-		if err := r.Client.Get(ctx, targetTCPProxyObjectKey, &targetTCPProxy); client.IgnoreNotFound(err) != nil {
+		if err := r.InfraClient.Get(ctx, targetTCPProxyObjectKey, &targetTCPProxy); client.IgnoreNotFound(err) != nil {
 			return fmt.Errorf("failed fetching target TCP proxy: %w", err)
 		}
 
@@ -462,11 +466,11 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 				},
 			}
 
-			if err := controllerutil.SetControllerReference(workload, &targetTCPProxy, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on target TCP proxy: %w", err)
+			if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &targetTCPProxy, r.Scheme); err != nil {
+				return fmt.Errorf("failed failed to set owner on target TCP proxy: %w", err)
 			}
 
-			if err := r.Client.Create(ctx, &targetTCPProxy); err != nil {
+			if err := r.InfraClient.Create(ctx, &targetTCPProxy); err != nil {
 				return fmt.Errorf("failed to create target TCP proxy: %w", err)
 			}
 
@@ -488,7 +492,7 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 			Name:      forwardingRuleName,
 		}
 
-		if err := r.Client.Get(ctx, forwardingRuleObjectKey, &forwardingRule); client.IgnoreNotFound(err) != nil {
+		if err := r.InfraClient.Get(ctx, forwardingRuleObjectKey, &forwardingRule); client.IgnoreNotFound(err) != nil {
 			return fmt.Errorf("failed fetching forwarding rule for TCP proxy: %w", err)
 		}
 
@@ -524,11 +528,11 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 				},
 			}
 
-			if err := controllerutil.SetControllerReference(workload, &forwardingRule, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on forwarding rule: %w", err)
+			if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &forwardingRule, r.Scheme); err != nil {
+				return fmt.Errorf("failed failed to set owner on forwarding rule: %w", err)
 			}
 
-			if err := r.Client.Create(ctx, &forwardingRule); err != nil {
+			if err := r.InfraClient.Create(ctx, &forwardingRule); err != nil {
 				return fmt.Errorf("failed to create forwarding rule for TCP proxy: %w", err)
 			}
 		}
@@ -560,7 +564,7 @@ func (r *WorkloadGatewayReconciler) reconcileBackendService(
 	healthCheck *kcccomputev1beta1.ComputeHealthCheck,
 	backendService *kcccomputev1beta1.ComputeBackendService,
 ) (controllerutil.OperationResult, error) {
-	return controllerutil.CreateOrUpdate(ctx, r.Client, backendService, func() error {
+	return controllerutil.CreateOrUpdate(ctx, r.InfraClient, backendService, func() error {
 		if backendService.CreationTimestamp.IsZero() {
 			logger.Info("creating backend service")
 		} else {
@@ -594,7 +598,7 @@ func (r *WorkloadGatewayReconciler) reconcileBackendService(
 				Namespace: workload.Namespace,
 				Name:      fmt.Sprintf("deployment-%s", deployment.UID),
 			}
-			if err := r.Client.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); err != nil {
+			if err := r.InfraClient.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); err != nil {
 				return fmt.Errorf("failed fetching instance group manager for deployment: %w", err)
 			}
 
@@ -646,8 +650,8 @@ func (r *WorkloadGatewayReconciler) reconcileBackendService(
 
 		backendService.Spec.Backend = backends
 
-		if err := controllerutil.SetControllerReference(workload, backendService, r.Scheme); err != nil {
-			return fmt.Errorf("failed to set controller on backend service: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, backendService, r.Scheme); err != nil {
+			return fmt.Errorf("failed failed to set owner on backend service: %w", err)
 		}
 
 		return nil
@@ -667,6 +671,10 @@ func (r *WorkloadGatewayReconciler) Finalize(
 	// deleted by GC.
 	//
 	// Make sure to update the status conditions
+
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj); err != nil {
+		return finalizer.Result{}, fmt.Errorf("failed deleting instance group manager anchor: %w", err)
+	}
 
 	return finalizer.Result{}, nil
 }
@@ -708,7 +716,7 @@ func getGatewayBackendPorts(workload *computev1alpha.Workload) sets.Set[computev
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *WorkloadGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *WorkloadGatewayReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
 
 	r.finalizers = finalizer.NewFinalizers()
 	if err := r.finalizers.Register(gcpWorkloadFinalizer, r); err != nil {
@@ -734,12 +742,40 @@ func (r *WorkloadGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&computev1alpha.Workload{}).
 		Owns(&computev1alpha.WorkloadDeployment{}).
-		Owns(&kcccomputev1beta1.ComputeAddress{}).
-		Owns(&kcccomputev1beta1.ComputeFirewall{}).
-		Owns(&kcccomputev1beta1.ComputeHealthCheck{}).
-		Owns(&kcccomputev1beta1.ComputeBackendService{}).
-		Owns(&kcccomputev1beta1.ComputeTargetTCPProxy{}).
-		Owns(&kcccomputev1beta1.ComputeForwardingRule{}).
-		Owns(&instanceGroupManager).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeAddress{},
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeAddress](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeFirewall{},
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeFirewall](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeHealthCheck{},
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeHealthCheck](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeBackendService{},
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeBackendService](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeTargetTCPProxy{},
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeTargetTCPProxy](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&kcccomputev1beta1.ComputeForwardingRule{},
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeForwardingRule](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
+		WatchesRawSource(source.TypedKind(
+			infraCluster.GetCache(),
+			&instanceGroupManager,
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*unstructured.Unstructured](mgr.GetScheme(), &computev1alpha.Workload{}),
+		)).
 		Complete(r)
 }
