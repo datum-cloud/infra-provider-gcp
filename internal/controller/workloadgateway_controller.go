@@ -26,12 +26,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
+	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -238,8 +238,8 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayAddress(
 			},
 		}
 
-		if err := controllerutil.SetControllerReference(workload, &address, r.Scheme); err != nil {
-			return address, fmt.Errorf("failed to set controller on IP address: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &address, r.Scheme); err != nil {
+			return address, fmt.Errorf("failed failed to set owner on IP address: %w", err)
 		}
 
 		if err := r.InfraClient.Create(ctx, &address); err != nil {
@@ -309,8 +309,8 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayLBFirewall(
 			},
 		}
 
-		if err := controllerutil.SetControllerReference(workload, &firewall, r.Scheme); err != nil {
-			return firewall, fmt.Errorf("failed to set controller on firewall: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &firewall, r.Scheme); err != nil {
+			return firewall, fmt.Errorf("failed failed to set owner on firewall: %w", err)
 		}
 
 		for _, namedPort := range backendPorts.UnsortedList() {
@@ -392,8 +392,8 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 				},
 			}
 
-			if err := controllerutil.SetControllerReference(workload, &healthCheck, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on health check: %w", err)
+			if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &healthCheck, r.Scheme); err != nil {
+				return fmt.Errorf("failed failed to set owner on health check: %w", err)
 			}
 
 			if err := r.InfraClient.Create(ctx, &healthCheck); err != nil {
@@ -466,8 +466,8 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 				},
 			}
 
-			if err := controllerutil.SetControllerReference(workload, &targetTCPProxy, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on target TCP proxy: %w", err)
+			if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &targetTCPProxy, r.Scheme); err != nil {
+				return fmt.Errorf("failed failed to set owner on target TCP proxy: %w", err)
 			}
 
 			if err := r.InfraClient.Create(ctx, &targetTCPProxy); err != nil {
@@ -528,8 +528,8 @@ func (r *WorkloadGatewayReconciler) reconcileGatewayBackendServices(
 				},
 			}
 
-			if err := controllerutil.SetControllerReference(workload, &forwardingRule, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller on forwarding rule: %w", err)
+			if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, &forwardingRule, r.Scheme); err != nil {
+				return fmt.Errorf("failed failed to set owner on forwarding rule: %w", err)
 			}
 
 			if err := r.InfraClient.Create(ctx, &forwardingRule); err != nil {
@@ -650,8 +650,8 @@ func (r *WorkloadGatewayReconciler) reconcileBackendService(
 
 		backendService.Spec.Backend = backends
 
-		if err := controllerutil.SetControllerReference(workload, backendService, r.Scheme); err != nil {
-			return fmt.Errorf("failed to set controller on backend service: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, workload, backendService, r.Scheme); err != nil {
+			return fmt.Errorf("failed failed to set owner on backend service: %w", err)
 		}
 
 		return nil
@@ -671,6 +671,10 @@ func (r *WorkloadGatewayReconciler) Finalize(
 	// deleted by GC.
 	//
 	// Make sure to update the status conditions
+
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj); err != nil {
+		return finalizer.Result{}, fmt.Errorf("failed deleting instance group manager anchor: %w", err)
+	}
 
 	return finalizer.Result{}, nil
 }
@@ -741,37 +745,37 @@ func (r *WorkloadGatewayReconciler) SetupWithManager(mgr ctrl.Manager, infraClus
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeAddress{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeAddress](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeAddress](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeFirewall{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeFirewall](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeFirewall](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeHealthCheck{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeHealthCheck](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeHealthCheck](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeBackendService{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeBackendService](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeBackendService](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeTargetTCPProxy{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeTargetTCPProxy](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeTargetTCPProxy](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeForwardingRule{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeForwardingRule](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeForwardingRule](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&instanceGroupManager,
-			handler.TypedEnqueueRequestForOwner[*unstructured.Unstructured](mgr.GetScheme(), mgr.GetRESTMapper(), &computev1alpha.Workload{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*unstructured.Unstructured](mgr.GetScheme(), &computev1alpha.Workload{}),
 		)).
 		Complete(r)
 }

@@ -181,21 +181,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.WorkloadGatewayReconciler{
+	if err = (&controller.InfraClusterNamespaceReconciler{
 		Client:      mgr.GetClient(),
 		InfraClient: infraCluster.GetClient(),
 		Scheme:      mgr.GetScheme(),
-		GCPProject:  gcpProject,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
+		setupLog.Error(err, "unable to create controller", "controller", "InfraClusterNamespaceReconciler")
 		os.Exit(1)
 	}
+
+	// TODO(jreese) rework the gateway controller when we have a higher level
+	// orchestrator from network-services-operator that schedules "sub gateways"
+	// onto clusters, similar to Workloads -> WorkloadDeployments and
+	// Networks -> NetworkContexts
+	//
+	// if err = (&controller.WorkloadGatewayReconciler{
+	// 	Client:      mgr.GetClient(),
+	// 	InfraClient: infraCluster.GetClient(),
+	// 	Scheme:      mgr.GetScheme(),
+	// 	GCPProject:  gcpProject,
+	// }).SetupWithManager(mgr, infraCluster); err != nil {
+	// 	setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
+	// 	os.Exit(1)
+	// }
 
 	if err = (&controller.WorkloadDeploymentReconciler{
 		Client:      mgr.GetClient(),
 		InfraClient: infraCluster.GetClient(),
 		Scheme:      mgr.GetScheme(),
-		GCPProject:  gcpProject,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
 		os.Exit(1)
@@ -205,7 +218,6 @@ func main() {
 		Client:      mgr.GetClient(),
 		InfraClient: infraCluster.GetClient(),
 		Scheme:      mgr.GetScheme(),
-		GCPProject:  gcpProject,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InstanceDiscoveryReconciler")
 		os.Exit(1)
@@ -215,7 +227,6 @@ func main() {
 		Client:      mgr.GetClient(),
 		InfraClient: infraCluster.GetClient(),
 		Scheme:      mgr.GetScheme(),
-		GCPProject:  gcpProject,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
 		os.Exit(1)

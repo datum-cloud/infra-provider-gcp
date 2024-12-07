@@ -17,12 +17,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
+	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
 
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 )
@@ -33,7 +33,8 @@ type NetworkContextReconciler struct {
 	client.Client
 	InfraClient client.Client
 	Scheme      *runtime.Scheme
-	GCPProject  string
+
+	finalizers finalizer.Finalizers
 }
 
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=networkcontexts,verbs=get;list;watch
@@ -54,12 +55,23 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	if !networkContext.DeletionTimestamp.IsZero() {
+	logger.Info("reconciling network context")
+	defer logger.Info("reconcile complete")
+
+	finalizationResult, err := r.finalizers.Finalize(ctx, &networkContext)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to finalize: %w", err)
+	}
+	if finalizationResult.Updated {
+		if err = r.Client.Update(ctx, &networkContext); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update based on finalization result: %w", err)
+		}
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("reconciling network context")
-	defer logger.Info("reconcile complete")
+	if !networkContext.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
 
 	readyCondition := metav1.Condition{
 		Type:               networkingv1alpha.NetworkBindingReady,
@@ -81,6 +93,19 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}()
 
+	var location networkingv1alpha.Location
+	locationObjectKey := client.ObjectKey{
+		Namespace: networkContext.Spec.Location.Namespace,
+		Name:      networkContext.Spec.Location.Name,
+	}
+	if err := r.Client.Get(ctx, locationObjectKey, &location); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching cluster: %w", err)
+	}
+
+	if location.Spec.Provider.GCP == nil {
+		return ctrl.Result{}, fmt.Errorf("attached cluster is not for the GCP provider")
+	}
+
 	var network networkingv1alpha.Network
 	networkObjectKey := client.ObjectKey{
 		Namespace: networkContext.Namespace,
@@ -90,11 +115,16 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("failed fetching network: %w", err)
 	}
 
+	infraClusterNamespaceName, err := crossclusterutil.InfraClusterNamespaceNameFromUpstream(ctx, r.Client, networkContext.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	kccNetworkName := fmt.Sprintf("network-%s", networkContext.UID)
 
 	var kccNetwork kcccomputev1beta1.ComputeNetwork
 	kccNetworkObjectKey := client.ObjectKey{
-		Namespace: networkContext.Namespace,
+		Namespace: infraClusterNamespaceName,
 		Name:      kccNetworkName,
 	}
 	if err := r.InfraClient.Get(ctx, kccNetworkObjectKey, &kccNetwork); client.IgnoreNotFound(err) != nil {
@@ -106,10 +136,10 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		kccNetwork = kcccomputev1beta1.ComputeNetwork{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: networkContext.Namespace,
-				Name:      kccNetworkName,
+				Namespace: kccNetworkObjectKey.Namespace,
+				Name:      kccNetworkObjectKey.Name,
 				Annotations: map[string]string{
-					GCPProjectAnnotation: r.GCPProject,
+					GCPProjectAnnotation: location.Spec.Provider.GCP.ProjectID,
 				},
 			},
 			Spec: kcccomputev1beta1.ComputeNetworkSpec{
@@ -119,8 +149,8 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 		kccNetwork.Spec.AutoCreateSubnetworks = proto.Bool(false)
 
-		if err := controllerutil.SetControllerReference(&networkContext, &kccNetwork, r.Scheme); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to set controller on firewall: %w", err)
+		if err := crossclusterutil.SetControllerReference(ctx, r.InfraClient, &networkContext, &kccNetwork, r.Scheme); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set controller on network context: %w", err)
 		}
 
 		if err := r.InfraClient.Create(ctx, &kccNetwork); err != nil {
@@ -142,14 +172,31 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
+func (r *NetworkContextReconciler) Finalize(
+	ctx context.Context,
+	obj client.Object,
+) (finalizer.Result, error) {
+
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj); err != nil {
+		return finalizer.Result{}, fmt.Errorf("failed deleting network context anchor: %w", err)
+	}
+
+	return finalizer.Result{}, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *NetworkContextReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
+	r.finalizers = finalizer.NewFinalizers()
+	if err := r.finalizers.Register(gcpInfraFinalizer, r); err != nil {
+		return fmt.Errorf("failed to register finalizer: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1alpha.NetworkContext{}).
 		WatchesRawSource(source.TypedKind(
 			infraCluster.GetCache(),
 			&kcccomputev1beta1.ComputeNetwork{},
-			handler.TypedEnqueueRequestForOwner[*kcccomputev1beta1.ComputeNetwork](mgr.GetScheme(), mgr.GetRESTMapper(), &networkingv1alpha.NetworkContext{}),
+			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeNetwork](mgr.GetScheme(), &networkingv1alpha.NetworkContext{}),
 		)).
 		Complete(r)
 }
