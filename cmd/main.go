@@ -53,12 +53,13 @@ func init() {
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
+	var leaderElectionNamespace string
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
-	var gcpProject string
 	var upstreamKubeconfig string
+	var locationClassName string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -66,16 +67,23 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&leaderElectionNamespace, "leader-elect-namespace", "", "The namespace to use for leader election.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 
-	// Ideally the project would come from the ClusterProfile, just need to think of
-	// how to propagate that information for entities that don't have a ClusterProfile
-	// on them, and what to do in cases where entities can't span projects (assuming
-	// that LB backends can't - but haven't checked network endpoint groups)
-	flag.StringVar(&gcpProject, "gcp-project", "", "The GCP project to provision resources in.")
+	// TODO(jreese) move to an approach that leverages a CRD to configure which
+	// locations this deployment of infra-provider-gcp will consider. Should
+	// include things like label or field selectors, anti-affinities for resources,
+	// etc. When this is done, we should investigate leveraging the `ByObject`
+	// setting of the informer cache to prevent populating the cache with entities
+	// which the operator does not need to receive. We'll likely need to lean
+	// into well known labels here, since a location class is defined on a location,
+	// which entities only reference and do not embed.
+	flag.StringVar(&locationClassName, "location-class", "self-managed", "Only consider resources attached to locations with the "+
+		"specified location class.")
+
 	opts := zap.Options{
 		Development: true,
 	}
@@ -143,12 +151,14 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(upstreamClusterConfig, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "fddf20f1.datumapis.com",
+		Scheme:                  scheme,
+		Metrics:                 metricsServerOptions,
+		WebhookServer:           webhookServer,
+		HealthProbeBindAddress:  probeAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "fddf20f1.datumapis.com",
+		LeaderElectionNamespace: leaderElectionNamespace,
+
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -206,9 +216,10 @@ func main() {
 	// }
 
 	if err = (&controller.WorkloadDeploymentReconciler{
-		Client:      mgr.GetClient(),
-		InfraClient: infraCluster.GetClient(),
-		Scheme:      mgr.GetScheme(),
+		Client:            mgr.GetClient(),
+		InfraClient:       infraCluster.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		LocationClassName: locationClassName,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
 		os.Exit(1)
@@ -224,9 +235,10 @@ func main() {
 	}
 
 	if err = (&controller.NetworkContextReconciler{
-		Client:      mgr.GetClient(),
-		InfraClient: infraCluster.GetClient(),
-		Scheme:      mgr.GetScheme(),
+		Client:            mgr.GetClient(),
+		InfraClient:       infraCluster.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		LocationClassName: locationClassName,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
 		os.Exit(1)

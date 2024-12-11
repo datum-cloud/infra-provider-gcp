@@ -41,6 +41,7 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
 	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
+	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -63,8 +64,9 @@ var populateSecretsScript string
 // WorkloadDeploymentReconciler reconciles a WorkloadDeployment object
 type WorkloadDeploymentReconciler struct {
 	client.Client
-	InfraClient client.Client
-	Scheme      *runtime.Scheme
+	InfraClient       client.Client
+	Scheme            *runtime.Scheme
+	LocationClassName string
 
 	finalizers finalizer.Finalizers
 }
@@ -102,6 +104,19 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 		}
 		return ctrl.Result{}, err
 	}
+
+	// Don't do anything if a location isn't set
+	if deployment.Status.Location == nil {
+		return ctrl.Result{}, nil
+	}
+
+	_, shouldProcess, err := locationutil.GetLocation(ctx, r.Client, *deployment.Status.Location, r.LocationClassName)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if !shouldProcess {
+		return ctrl.Result{}, nil
+	}
+
 	logger.Info("reconciling deployment")
 	defer logger.Info("reconcile complete")
 
@@ -122,11 +137,6 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	// TODO(jreese) for both this reconciler and the gateway one, handle updates
 	// appropriately.
-
-	// Don't do anything if a location isn't set
-	if deployment.Status.Location == nil {
-		return ctrl.Result{}, nil
-	}
 
 	runtime := deployment.Spec.Template.Spec.Runtime
 	if runtime.Sandbox != nil {

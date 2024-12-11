@@ -23,6 +23,7 @@ import (
 
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
 	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
+	"go.datum.net/infra-provider-gcp/internal/locationutil"
 
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 )
@@ -31,8 +32,9 @@ import (
 // ComputeNetwork is created to represent the context within GCP.
 type NetworkContextReconciler struct {
 	client.Client
-	InfraClient client.Client
-	Scheme      *runtime.Scheme
+	InfraClient       client.Client
+	Scheme            *runtime.Scheme
+	LocationClassName string
 
 	finalizers finalizer.Finalizers
 }
@@ -53,6 +55,13 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	location, shouldProcess, err := locationutil.GetLocation(ctx, r.Client, networkContext.Spec.Location, r.LocationClassName)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if !shouldProcess {
+		return ctrl.Result{}, nil
 	}
 
 	logger.Info("reconciling network context")
@@ -92,19 +101,6 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			err = r.Client.Status().Update(ctx, &networkContext)
 		}
 	}()
-
-	var location networkingv1alpha.Location
-	locationObjectKey := client.ObjectKey{
-		Namespace: networkContext.Spec.Location.Namespace,
-		Name:      networkContext.Spec.Location.Name,
-	}
-	if err := r.Client.Get(ctx, locationObjectKey, &location); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed fetching cluster: %w", err)
-	}
-
-	if location.Spec.Provider.GCP == nil {
-		return ctrl.Result{}, fmt.Errorf("attached cluster is not for the GCP provider")
-	}
 
 	var network networkingv1alpha.Network
 	networkObjectKey := client.ObjectKey{
