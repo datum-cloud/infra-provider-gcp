@@ -228,10 +228,19 @@ func (r *InstanceDiscoveryReconciler) reconcileDatumInstance(
 		return ctrl.Result{}, fmt.Errorf("failed fetching gcp instance for managed instance: %w", err)
 	}
 
+	// Transform the instance name to what's expected based off of the workload
+	// deployment.
+
+	if instance.Name == nil {
+		return ctrl.Result{}, fmt.Errorf("GCP instance name is nil, expected a value")
+	}
+
+	datumInstanceName := fmt.Sprintf("%s-%s", workloadDeployment.Name, (*instance.Name)[strings.LastIndex(*instance.Name, "-")+1:])
+
 	datumInstance := &computev1alpha.Instance{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: workloadDeployment.Namespace,
-			Name:      *managedInstance.Name,
+			Name:      datumInstanceName,
 		},
 	}
 
