@@ -1,0 +1,130 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - compute.cnrm.cloud.google.com
+  resources:
+  - computeaddresses
+  - computebackendservices
+  - computefirewalls
+  - computeforwardingrules
+  - computehealthchecks
+  - computeinstancegroupmanagers
+  - computeinstancetemplates
+  - computenetworks
+  - computesubnetworks
+  - computetargettcpproxies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - compute.cnrm.cloud.google.com
+  resources:
+  - computeaddresses/status
+  - computebackendservices/status
+  - computefirewalls/status
+  - computeforwardingrules/status
+  - computehealthchecks/status
+  - computeinstancegroupmanager/status
+  - computeinstancegroupmanagers/status
+  - computeinstancetemplates/status
+  - computenetworks/status
+  - computesubnetworks/status
+  - computetargettcpproxies/status
+  verbs:
+  - get
+- apiGroups:
+  - compute.cnrm.cloud.google.com
+  resources:
+  - computeinstancegroupmanager
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts/finalizers
+  - workloaddeployments/finalizers
+  - workloads/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - networkcontexts/status
+  - workloaddeployments/status
+  - workloads/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - workloaddeployments
+  - workloads
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - iam.cnrm.cloud.google.com
+  resources:
+  - iampolicies
+  - iamserviceaccounts
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - iam.cnrm.cloud.google.com
+  resources:
+  - iampolicies/status
+  - iamserviceaccounts/status
+  verbs:
+  - get
+- apiGroups:
+  - secretmanager.cnrm.cloud.google.com
+  resources:
+  - secretmanagersecrets
+  - secretmanagersecretversions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - secretmanager.cnrm.cloud.google.com
+  resources:
+  - secretmanagersecrets/status
+  - secretmanagersecretversions/status
+  verbs:
+  - get
