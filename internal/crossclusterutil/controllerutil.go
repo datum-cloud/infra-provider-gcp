@@ -106,12 +106,8 @@ func DeleteAnchorForObject(
 	upstreamClient client.Client,
 	infraClusterClient client.Client,
 	owner client.Object,
+	infraClusterNamespaceName string,
 ) error {
-
-	infraClusterNamespaceName, err := InfraClusterNamespaceNameFromUpstream(ctx, upstreamClient, owner.GetNamespace())
-	if err != nil {
-		return err
-	}
 
 	listOpts := []client.ListOption{
 		client.InNamespace(infraClusterNamespaceName),

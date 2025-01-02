@@ -56,7 +56,7 @@ var machineTypeMap = map[string]string{
 }
 
 const gcpInfraFinalizer = "compute.datumapis.com/infra-provider-gcp-deployment-controller"
-const deploymentNameLabel = "compute.datumapis.com/deployment-name"
+const deploymentUIDLabel = "compute.datumapis.com/deployment-uid"
 
 //go:embed cloudinit/populate_secrets.py
 var populateSecretsScript string
@@ -64,9 +64,10 @@ var populateSecretsScript string
 // WorkloadDeploymentReconciler reconciles a WorkloadDeployment object
 type WorkloadDeploymentReconciler struct {
 	client.Client
-	InfraClient       client.Client
-	Scheme            *runtime.Scheme
-	LocationClassName string
+	InfraClient               client.Client
+	Scheme                    *runtime.Scheme
+	LocationClassName         string
+	InfraClusterNamespaceName string
 
 	finalizers finalizer.Finalizers
 }
@@ -216,11 +217,6 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 	gcpRegion := location.Spec.Provider.GCP.Region
 	gcpZone := location.Spec.Provider.GCP.Zone
 
-	infraClusterNamespaceName, err := crossclusterutil.InfraClusterNamespaceNameFromUpstream(ctx, r.Client, deployment.Namespace)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
 	cloudConfig.Hostname = fmt.Sprintf(`{%% set parts = v1.local_hostname.split('-') %%}
 %s-{{ parts[-1] }}`, deployment.Name)
 	cloudConfig.PreserveHostname = proto.Bool(false)
@@ -248,7 +244,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		}
 	}()
 
-	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, logger, gcpProject, infraClusterNamespaceName, deployment); err != nil {
+	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, logger, gcpProject, r.InfraClusterNamespaceName, deployment); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
 	}
 
@@ -259,7 +255,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 
 	var serviceAccount kcciamv1beta1.IAMServiceAccount
 	serviceAccountObjectKey := client.ObjectKey{
-		Namespace: infraClusterNamespaceName,
+		Namespace: r.InfraClusterNamespaceName,
 		Name:      fmt.Sprintf("workload-%d", h.Sum32()),
 	}
 	if err := r.InfraClient.Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
@@ -295,16 +291,22 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		return ctrl.Result{}, nil
 	}
 
+	// TODO(jreese) add IAM Policy to the GCP service account to allow the service
+	// account used by k8s-config-connector the `roles/iam.serviceAccountUser` role,
+	// so that it can create instances with the service account without needing a
+	// project level role binding. Probably just pass in the service account
+	// email, otherwise we'd have to do some kind of discovery.
+
 	if err := r.reconcileConfigMaps(ctx, cloudConfig, deployment); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
 	}
 
-	proceed, err := r.reconcileSecrets(ctx, logger, gcpProject, infraClusterNamespaceName, &availableCondition, cloudConfig, deployment, serviceAccount)
+	proceed, err := r.reconcileSecrets(ctx, logger, gcpProject, r.InfraClusterNamespaceName, &availableCondition, cloudConfig, deployment, serviceAccount)
 	if !proceed || err != nil {
 		return ctrl.Result{}, err
 	}
 
-	result, instanceTemplate, oldInstanceTemplate, err := r.reconcileInstanceTemplate(ctx, logger, gcpProject, gcpRegion, infraClusterNamespaceName, &availableCondition, deployment, cloudConfig, instanceMetadata, &serviceAccount)
+	result, instanceTemplate, oldInstanceTemplate, err := r.reconcileInstanceTemplate(ctx, logger, gcpProject, gcpRegion, r.InfraClusterNamespaceName, &availableCondition, deployment, cloudConfig, instanceMetadata, &serviceAccount)
 	if !result.IsZero() || err != nil {
 		return result, err
 	}
@@ -315,7 +317,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		return ctrl.Result{}, nil
 	}
 
-	instanceGroupManager, err := r.reconcileInstanceGroupManager(ctx, logger, gcpProject, gcpZone, infraClusterNamespaceName, &availableCondition, deployment, instanceTemplate)
+	instanceGroupManager, err := r.reconcileInstanceGroupManager(ctx, logger, gcpProject, gcpZone, r.InfraClusterNamespaceName, &availableCondition, deployment, instanceTemplate)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -561,9 +563,7 @@ func (r *WorkloadDeploymentReconciler) reconcileVMRuntimeDeployment(
 		if attachment.MountPath != nil {
 			volume := volumeMap[attachment.Name]
 
-			if volume.Disk != nil {
-				// Currently handed inside `buildInstanceTemplateVolumes`
-			}
+			// Disk backed volumes are currently handed inside `buildInstanceTemplateVolumes`
 
 			if volume.ConfigMap != nil {
 				// Cloud-init will place files at /etc/configmaps/<name>/<key>
@@ -1019,7 +1019,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 		[]client.ListOption{
 			client.InNamespace(infraClusterNamespaceName),
 			client.MatchingLabels{
-				deploymentNameLabel: deployment.Name,
+				deploymentUIDLabel: string(deployment.UID),
 			},
 		}...,
 	); err != nil {
@@ -1065,7 +1065,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 					GCPProjectAnnotation: gcpProject,
 				},
 				Labels: map[string]string{
-					deploymentNameLabel: deployment.Name,
+					deploymentUIDLabel: string(deployment.UID),
 				},
 			},
 			Spec: kcccomputev1beta1.ComputeInstanceTemplateSpec{
@@ -1657,11 +1657,6 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 ) (finalizer.Result, error) {
 	deployment := obj.(*computev1alpha.WorkloadDeployment)
 
-	infraClusterNamespaceName, err := crossclusterutil.InfraClusterNamespaceNameFromUpstream(ctx, r.Client, deployment.Namespace)
-	if err != nil {
-		return finalizer.Result{}, err
-	}
-
 	// Delete child entities in a sequence that does not result in exponential
 	// backoffs of deletion attempts that occurs when they're all deleted by GC.
 	instanceGroupManagerName := fmt.Sprintf("deployment-%s", deployment.UID)
@@ -1669,7 +1664,7 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 	var instanceGroupManager unstructured.Unstructured
 	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
 	instanceGroupManagerObjectKey := client.ObjectKey{
-		Namespace: infraClusterNamespaceName,
+		Namespace: r.InfraClusterNamespaceName,
 		Name:      instanceGroupManagerName,
 	}
 	if err := r.InfraClient.Get(ctx, instanceGroupManagerObjectKey, &instanceGroupManager); client.IgnoreNotFound(err) != nil {
@@ -1689,9 +1684,9 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 		ctx,
 		&instanceTemplates,
 		[]client.ListOption{
-			client.InNamespace(infraClusterNamespaceName),
+			client.InNamespace(r.InfraClusterNamespaceName),
 			client.MatchingLabels{
-				deploymentNameLabel: deployment.Name,
+				deploymentUIDLabel: string(deployment.UID),
 			},
 		}...,
 	); err != nil {
@@ -1710,7 +1705,7 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 	// - Deployment specific secret related entities
 	// - Interface specific firewall rules
 
-	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, deployment); err != nil {
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, deployment, r.InfraClusterNamespaceName); err != nil {
 		return finalizer.Result{}, fmt.Errorf("failed deleting instance group manager anchor: %w", err)
 	}
 

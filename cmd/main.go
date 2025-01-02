@@ -60,6 +60,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var upstreamKubeconfig string
 	var locationClassName string
+	var infraNamespace string
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -81,8 +82,12 @@ func main() {
 	// which the operator does not need to receive. We'll likely need to lean
 	// into well known labels here, since a location class is defined on a location,
 	// which entities only reference and do not embed.
-	flag.StringVar(&locationClassName, "location-class", "self-managed", "Only consider resources attached to locations with the "+
-		"specified location class.")
+	flag.StringVar(
+		&locationClassName,
+		"location-class",
+		"self-managed",
+		"Only consider resources attached to locations with the  specified location class.",
+	)
 
 	opts := zap.Options{
 		Development: true,
@@ -91,6 +96,9 @@ func main() {
 
 	flag.StringVar(&upstreamKubeconfig, "upstream-kubeconfig", "", "absolute path to the kubeconfig "+
 		"file for the API server that is the source of truth for datum entities")
+
+	flag.StringVar(&infraNamespace, "infra-namespace", "", "The namespace which resources for managing GCP entities "+
+		"should be created in.")
 
 	flag.Parse()
 
@@ -144,6 +152,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if len(infraNamespace) == 0 {
+		setupLog.Info("must provide --infra-namespace")
+		os.Exit(1)
+	}
+
 	upstreamClusterConfig, err := clientcmd.BuildConfigFromFlags("", upstreamKubeconfig)
 	if err != nil {
 		setupLog.Error(err, "unable to load control plane kubeconfig")
@@ -191,15 +204,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.InfraClusterNamespaceReconciler{
-		Client:      mgr.GetClient(),
-		InfraClient: infraCluster.GetClient(),
-		Scheme:      mgr.GetScheme(),
-	}).SetupWithManager(mgr, infraCluster); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "InfraClusterNamespaceReconciler")
-		os.Exit(1)
-	}
-
 	// TODO(jreese) rework the gateway controller when we have a higher level
 	// orchestrator from network-services-operator that schedules "sub gateways"
 	// onto clusters, similar to Workloads -> WorkloadDeployments and
@@ -216,10 +220,11 @@ func main() {
 	// }
 
 	if err = (&controller.WorkloadDeploymentReconciler{
-		Client:            mgr.GetClient(),
-		InfraClient:       infraCluster.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		LocationClassName: locationClassName,
+		Client:                    mgr.GetClient(),
+		InfraClient:               infraCluster.GetClient(),
+		Scheme:                    mgr.GetScheme(),
+		LocationClassName:         locationClassName,
+		InfraClusterNamespaceName: infraNamespace,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
 		os.Exit(1)
@@ -235,10 +240,11 @@ func main() {
 	}
 
 	if err = (&controller.NetworkContextReconciler{
-		Client:            mgr.GetClient(),
-		InfraClient:       infraCluster.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		LocationClassName: locationClassName,
+		Client:                    mgr.GetClient(),
+		InfraClient:               infraCluster.GetClient(),
+		Scheme:                    mgr.GetScheme(),
+		LocationClassName:         locationClassName,
+		InfraClusterNamespaceName: infraNamespace,
 	}).SetupWithManager(mgr, infraCluster); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
 		os.Exit(1)

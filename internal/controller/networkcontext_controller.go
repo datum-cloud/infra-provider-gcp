@@ -9,7 +9,6 @@ import (
 	kcccomputev1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/compute/v1beta1"
 	kcccomputev1alpha1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/k8s/v1alpha1"
 	"google.golang.org/protobuf/proto"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,7 +23,6 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
 	"go.datum.net/infra-provider-gcp/internal/crossclusterutil"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
-
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 )
 
@@ -32,9 +30,10 @@ import (
 // ComputeNetwork is created to represent the context within GCP.
 type NetworkContextReconciler struct {
 	client.Client
-	InfraClient       client.Client
-	Scheme            *runtime.Scheme
-	LocationClassName string
+	InfraClient               client.Client
+	Scheme                    *runtime.Scheme
+	LocationClassName         string
+	InfraClusterNamespaceName string
 
 	finalizers finalizer.Finalizers
 }
@@ -111,16 +110,11 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("failed fetching network: %w", err)
 	}
 
-	infraClusterNamespaceName, err := crossclusterutil.InfraClusterNamespaceNameFromUpstream(ctx, r.Client, networkContext.Namespace)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
 	kccNetworkName := fmt.Sprintf("network-%s", networkContext.UID)
 
 	var kccNetwork kcccomputev1beta1.ComputeNetwork
 	kccNetworkObjectKey := client.ObjectKey{
-		Namespace: infraClusterNamespaceName,
+		Namespace: r.InfraClusterNamespaceName,
 		Name:      kccNetworkName,
 	}
 	if err := r.InfraClient.Get(ctx, kccNetworkObjectKey, &kccNetwork); client.IgnoreNotFound(err) != nil {
@@ -173,7 +167,7 @@ func (r *NetworkContextReconciler) Finalize(
 	obj client.Object,
 ) (finalizer.Result, error) {
 
-	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj); err != nil {
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj, r.InfraClusterNamespaceName); err != nil {
 		return finalizer.Result{}, fmt.Errorf("failed deleting network context anchor: %w", err)
 	}
 

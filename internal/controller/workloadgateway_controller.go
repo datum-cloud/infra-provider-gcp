@@ -45,9 +45,10 @@ const deploymentWorkloadUID = "spec.workloadRef.uid"
 // gateways defined.
 type WorkloadGatewayReconciler struct {
 	client.Client
-	InfraClient client.Client
-	Scheme      *runtime.Scheme
-	GCPProject  string
+	InfraClient               client.Client
+	Scheme                    *runtime.Scheme
+	GCPProject                string
+	InfraClusterNamespaceName string
 
 	finalizers finalizer.Finalizers
 }
@@ -672,7 +673,7 @@ func (r *WorkloadGatewayReconciler) Finalize(
 	//
 	// Make sure to update the status conditions
 
-	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj); err != nil {
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, obj, r.InfraClusterNamespaceName); err != nil {
 		return finalizer.Result{}, fmt.Errorf("failed deleting instance group manager anchor: %w", err)
 	}
 
