@@ -94,8 +94,8 @@ build: manifests generate fmt vet ## Build manager binary.
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go -health-probe-bind-address 0 \
-		--kubeconfig=$(shell pwd)/infra.kubeconfig \
-		--upstream-kubeconfig=$(shell pwd)/upstream.kubeconfig
+		--upstream-kubeconfig=$(shell pwd)/upstream.kubeconfig \
+		--infra-namespace=default
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
