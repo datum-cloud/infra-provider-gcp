@@ -1,0 +1,24 @@
+name: Publish Artifacts
+
+on:
+  push:
+  release:
+    types: ['published']
+
+jobs:
+  publish-container-image:
+    uses: datum-cloud/actions/.github/workflows/publish-docker.yaml@v1.2.0
+    with:
+      image-name: infra-provider-gcp
+    secrets: inherit
+
+  publish-kustomize-bundles:
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    uses: datum-cloud/actions/.github/workflows/publish-kustomize-bundle.yaml@v1.2.0
+    with:
+      bundle-name: ghcr.io/datum-cloud/infra-provider-gcp-kustomize
+      bundle-path: config
+    secrets: inherit
