@@ -9,7 +9,7 @@ require (
 	github.com/googleapis/gax-go/v2 v2.14.0
 	github.com/onsi/ginkgo/v2 v2.19.0
 	github.com/onsi/gomega v1.33.1
-	github.com/stretchr/testify v1.9.0
+	github.com/stretchr/testify v1.10.0
 	go.datum.net/network-services-operator v0.0.0-20241205161241-d19fee49f0b7
 	go.datum.net/workload-operator v0.0.0-20241205164213-161fb5150fb8
 	google.golang.org/protobuf v1.35.1
