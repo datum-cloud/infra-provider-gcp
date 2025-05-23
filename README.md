@@ -35,11 +35,15 @@ direct VM instance control.
 - kubectl version v1.31.0+.
 - Access to a Kubernetes v1.31.0+ cluster.
 
-This provider makes use of the [GCP Config Connector][k8s-config-connector]
-project to manage resources in GCP. It is expected that the config connector
-and associated CRDs have been installed in the cluster.
+This provider makes use of [Crossplane][crossplane] to manage resources in GCP.
+It is expected that Crossplane and the following Crossplane GCP providers have
+been installed in the downstream cluster:
 
-[k8s-config-connector]: https://github.com/GoogleCloudPlatform/k8s-config-connector
+- [provider-gcp-cloudplatform](https://marketplace.upbound.io/providers/upbound/provider-gcp-cloudplatform)
+- [provider-gcp-compute](https://marketplace.upbound.io/providers/upbound/provider-gcp-compute)
+- [provider-gcp-secretmanager](https://marketplace.upbound.io/providers/upbound/provider-gcp-secretmanager)
+
+[crossplane]: https://crossplane.io/
 
 ### To Deploy on the cluster
 
@@ -51,7 +55,7 @@ make docker-build docker-push IMG=<some-registry>/tmp:tag
 
 **NOTE:** This image ought to be published in the personal registry you specified.
 And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Make sure you have the proper permission to the registry if the above commands don't work.
 
 **Install the CRDs into the cluster:**
 

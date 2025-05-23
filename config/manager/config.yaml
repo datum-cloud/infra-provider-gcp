@@ -1,0 +1,4 @@
+apiVersion: apiserver.config.datumapis.com/v1alpha1
+kind: GCPProvider
+metricsServer:
+  bindAddress: "0"
