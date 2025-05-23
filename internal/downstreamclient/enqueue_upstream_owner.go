@@ -1,4 +1,4 @@
-package crossclusterutil
+package downstreamclient
 
 import (
 	"context"
@@ -23,13 +23,14 @@ var _ mchandler.EventHandler = &enqueueRequestForOwner[client.Object]{}
 
 type empty struct{}
 
-// EnqueueRequestForUpstreamOwner enqueues Requests for the upstream Owners of an object.
+// TypedEnqueueRequestForUpstreamOwner enqueues Requests for the upstream Owners of an object.
 //
 // This handler depends on the `compute.datumapis.com/upstream-namespace` label
 // to exist on the resource for the event.
-func EnqueueRequestForUpstreamOwner(ownerType client.Object) mchandler.TypedEventHandlerFunc[client.Object, mcreconcile.Request] {
-	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-		e := &enqueueRequestForOwner[client.Object]{
+func TypedEnqueueRequestForUpstreamOwner[object client.Object](ownerType client.Object) mchandler.TypedEventHandlerFunc[object, mcreconcile.Request] {
+
+	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[object, mcreconcile.Request] {
+		e := &enqueueRequestForOwner[object]{
 			ownerType: ownerType,
 		}
 		if err := e.parseOwnerTypeGroupKind(cl.GetScheme()); err != nil {

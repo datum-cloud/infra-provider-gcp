@@ -70,7 +70,7 @@ func (r *InstanceDiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	finalizationResult, err := r.finalizers.Finalize(ctx, &instanceGroupManager)
 	if err != nil {
-		if v, ok := err.(kerrors.Aggregate); ok && v.Is(resourceIsDeleting) {
+		if v, ok := err.(kerrors.Aggregate); ok && v.Is(errResourceIsDeleting) {
 			logger.Info("resources are still deleting, requeuing")
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		} else {
