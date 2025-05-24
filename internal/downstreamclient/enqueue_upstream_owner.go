@@ -1,4 +1,4 @@
-package crossclusterutil
+package downstreamclient
 
 import (
 	"context"
@@ -23,13 +23,14 @@ var _ mchandler.EventHandler = &enqueueRequestForOwner[client.Object]{}
 
 type empty struct{}
 
-// EnqueueRequestForUpstreamOwner enqueues Requests for the upstream Owners of an object.
+// TypedEnqueueRequestForUpstreamOwner enqueues Requests for the upstream Owners of an object.
 //
 // This handler depends on the `compute.datumapis.com/upstream-namespace` label
 // to exist on the resource for the event.
-func EnqueueRequestForUpstreamOwner(ownerType client.Object) mchandler.TypedEventHandlerFunc[client.Object, mcreconcile.Request] {
-	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-		e := &enqueueRequestForOwner[client.Object]{
+func TypedEnqueueRequestForUpstreamOwner[object client.Object](ownerType client.Object) mchandler.TypedEventHandlerFunc[object, mcreconcile.Request] {
+
+	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[object, mcreconcile.Request] {
+		e := &enqueueRequestForOwner[object]{
 			ownerType: ownerType,
 		}
 		if err := e.parseOwnerTypeGroupKind(cl.GetScheme()); err != nil {
@@ -106,15 +107,15 @@ func (e *enqueueRequestForOwner[object]) parseOwnerTypeGroupKind(scheme *runtime
 // owners of object that match e.OwnerType.
 func (e *enqueueRequestForOwner[object]) getOwnerReconcileRequest(obj metav1.Object, result map[mcreconcile.Request]empty) {
 	labels := obj.GetLabels()
-	if labels[UpstreamOwnerKindLabel] == e.groupKind.Kind && labels[UpstreamOwnerGroupLabel] == e.groupKind.Group {
+	if labels[UpstreamOwnerKind] == e.groupKind.Kind && labels[UpstreamOwnerGroup] == e.groupKind.Group {
 		request := mcreconcile.Request{
 			Request: reconcile.Request{
 				NamespacedName: types.NamespacedName{
-					Name:      labels[UpstreamOwnerNameLabel],
-					Namespace: labels[UpstreamOwnerNamespaceLabel],
+					Name:      labels[UpstreamOwnerName],
+					Namespace: labels[UpstreamOwnerNamespace],
 				},
 			},
-			ClusterName: strings.TrimPrefix(strings.ReplaceAll(labels[UpstreamOwnerClusterNameLabel], "_", "/"), "cluster-"),
+			ClusterName: strings.TrimPrefix(strings.ReplaceAll(labels[UpstreamOwnerClusterName], "_", "/"), "cluster-"),
 		}
 		result[request] = empty{}
 	}

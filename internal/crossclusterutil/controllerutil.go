@@ -44,10 +44,11 @@ func SetControllerReference(
 	}
 
 	anchorLabels := map[string]string{
-		UpstreamOwnerGroupLabel:     gvk.Group,
-		UpstreamOwnerKindLabel:      gvk.Kind,
-		UpstreamOwnerNameLabel:      owner.GetName(),
-		UpstreamOwnerNamespaceLabel: owner.GetNamespace(),
+		UpstreamOwnerClusterNameLabel: "TODO",
+		UpstreamOwnerGroupLabel:       gvk.Group,
+		UpstreamOwnerKindLabel:        gvk.Kind,
+		UpstreamOwnerNameLabel:        owner.GetName(),
+		UpstreamOwnerNamespaceLabel:   owner.GetNamespace(),
 	}
 
 	listOpts := []client.ListOption{
@@ -90,6 +91,7 @@ func SetControllerReference(
 	if labels == nil {
 		labels = map[string]string{}
 	}
+	labels[UpstreamOwnerClusterNameLabel] = anchorLabels[UpstreamOwnerClusterNameLabel]
 	labels[UpstreamOwnerGroupLabel] = anchorLabels[UpstreamOwnerGroupLabel]
 	labels[UpstreamOwnerKindLabel] = anchorLabels[UpstreamOwnerKindLabel]
 	labels[UpstreamOwnerNameLabel] = anchorLabels[UpstreamOwnerNameLabel]

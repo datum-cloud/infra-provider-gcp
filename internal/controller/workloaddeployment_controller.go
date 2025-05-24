@@ -32,11 +32,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/source"
+	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/controller/k8sconfigconnector"
@@ -63,7 +65,8 @@ var populateSecretsScript string
 
 // WorkloadDeploymentReconciler reconciles a WorkloadDeployment object
 type WorkloadDeploymentReconciler struct {
-	client.Client
+	mgr mcmanager.Manager
+
 	InfraClient               client.Client
 	Scheme                    *runtime.Scheme
 	LocationClassName         string
@@ -76,30 +79,18 @@ type WorkloadDeploymentReconciler struct {
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloaddeployments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=workloaddeployments/finalizers,verbs=update
 
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computefirewalls,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computefirewalls/status,verbs=get
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computeinstancegroupmanagers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computeinstancegroupmanagers/status,verbs=get
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computeinstancetemplates,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computeinstancetemplates/status,verbs=get
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computesubnetworks,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computesubnetworks/status,verbs=get
-
-// +kubebuilder:rbac:groups=iam.cnrm.cloud.google.com,resources=iampolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=iam.cnrm.cloud.google.com,resources=iampolicies/status,verbs=get
-// +kubebuilder:rbac:groups=iam.cnrm.cloud.google.com,resources=iamserviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=iam.cnrm.cloud.google.com,resources=iamserviceaccounts/status,verbs=get
-
-// +kubebuilder:rbac:groups=secretmanager.cnrm.cloud.google.com,resources=secretmanagersecrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=secretmanager.cnrm.cloud.google.com,resources=secretmanagersecrets/status,verbs=get
-// +kubebuilder:rbac:groups=secretmanager.cnrm.cloud.google.com,resources=secretmanagersecretversions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=secretmanager.cnrm.cloud.google.com,resources=secretmanagersecretversions/status,verbs=get
-
-func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	cl, err := r.mgr.GetCluster(ctx, req.ClusterName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	ctx = mccontext.WithCluster(ctx, req.ClusterName)
+
 	var deployment computev1alpha.WorkloadDeployment
-	if err := r.Client.Get(ctx, req.NamespacedName, &deployment); err != nil {
+	if err := cl.GetClient().Get(ctx, req.NamespacedName, &deployment); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
@@ -111,7 +102,7 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	_, shouldProcess, err := locationutil.GetLocation(ctx, r.Client, *deployment.Status.Location, r.LocationClassName)
+	_, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), *deployment.Status.Location, r.LocationClassName)
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if !shouldProcess {
@@ -126,7 +117,7 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, fmt.Errorf("failed to finalize: %w", err)
 	}
 	if finalizationResult.Updated {
-		if err = r.Client.Update(ctx, &deployment); err != nil {
+		if err = cl.GetClient().Update(ctx, &deployment); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update based on finalization result: %w", err)
 		}
 		return ctrl.Result{}, nil
@@ -141,16 +132,18 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	runtime := deployment.Spec.Template.Spec.Runtime
 	if runtime.Sandbox != nil {
-		return r.reconcileSandboxRuntimeDeployment(ctx, logger, &deployment)
+		return r.reconcileSandboxRuntimeDeployment(ctx, cl.GetClient(), &deployment)
 	} else if runtime.VirtualMachine != nil {
-		return r.reconcileVMRuntimeDeployment(ctx, logger, &deployment)
+		return r.reconcileVMRuntimeDeployment(ctx, cl.GetClient(), &deployment)
 	}
 
 	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager, infraCluster cluster.Cluster) error {
+func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr mcmanager.Manager) error {
+	r.mgr = mgr
+
 	r.finalizers = finalizer.NewFinalizers()
 	if err := r.finalizers.Register(gcpInfraFinalizer, r); err != nil {
 		return fmt.Errorf("failed to register finalizer: %w", err)
@@ -161,51 +154,62 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager, infraC
 	var instanceGroupManager unstructured.Unstructured
 	instanceGroupManager.SetGroupVersionKind(kcccomputev1beta1.ComputeInstanceGroupManagerGVK)
 
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&computev1alpha.WorkloadDeployment{}).
-		Owns(&networkingv1alpha.NetworkBinding{}).
-		WatchesRawSource(source.TypedKind(
-			infraCluster.GetCache(),
+	return mcbuilder.ControllerManagedBy(mgr).
+		For(&computev1alpha.WorkloadDeployment{}, mcbuilder.WithEngageWithLocalCluster(false)).
+		Owns(&networkingv1alpha.NetworkBinding{}, mcbuilder.WithEngageWithLocalCluster(false)).
+		Watches(
 			&kcccomputev1beta1.ComputeFirewall{},
-			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeFirewall](mgr.GetScheme(), &computev1alpha.WorkloadDeployment{}),
-		)).
-		WatchesRawSource(source.TypedKind(
-			infraCluster.GetCache(),
+			crossclusterutil.EnqueueRequestForUpstreamOwner(&computev1alpha.WorkloadDeployment{}),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
+		).
+		Watches(
+			&kcccomputev1beta1.ComputeFirewall{},
+			crossclusterutil.EnqueueRequestForUpstreamOwner(&computev1alpha.WorkloadDeployment{}),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
+		).
+		Watches(
 			&kcccomputev1beta1.ComputeInstanceTemplate{},
-			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcccomputev1beta1.ComputeInstanceTemplate](mgr.GetScheme(), &computev1alpha.WorkloadDeployment{}),
-		)).
-		WatchesRawSource(source.TypedKind(
-			infraCluster.GetCache(),
+			crossclusterutil.EnqueueRequestForUpstreamOwner(&computev1alpha.WorkloadDeployment{}),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
+		).
+		Watches(
 			&kcciamv1beta1.IAMServiceAccount{},
-			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kcciamv1beta1.IAMServiceAccount](mgr.GetScheme(), &computev1alpha.WorkloadDeployment{}),
-		)).
-		WatchesRawSource(source.TypedKind(
-			infraCluster.GetCache(),
+			crossclusterutil.EnqueueRequestForUpstreamOwner(&computev1alpha.WorkloadDeployment{}),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
+		).
+		Watches(
 			&instanceGroupManager,
-			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*unstructured.Unstructured](mgr.GetScheme(), &computev1alpha.WorkloadDeployment{}),
-		)).
-		WatchesRawSource(source.TypedKind(
-			infraCluster.GetCache(),
+			crossclusterutil.EnqueueRequestForUpstreamOwner(&computev1alpha.WorkloadDeployment{}),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
+		).
+		Watches(
 			&kccsecretmanagerv1beta1.SecretManagerSecret{},
-			crossclusterutil.TypedEnqueueRequestForUpstreamOwner[*kccsecretmanagerv1beta1.SecretManagerSecret](mgr.GetScheme(), &computev1alpha.WorkloadDeployment{}),
-		)).
+			crossclusterutil.EnqueueRequestForUpstreamOwner(&computev1alpha.WorkloadDeployment{}),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
+		).
 		Complete(r)
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	deployment *computev1alpha.WorkloadDeployment,
 	cloudConfig *cloudinit.CloudConfig,
 	instanceMetadata []kcccomputev1beta1.InstancetemplateMetadata,
 ) (res ctrl.Result, err error) {
-
+	logger := log.FromContext(ctx)
 	var location networkingv1alpha.Location
 	locationObjectKey := client.ObjectKey{
 		Namespace: deployment.Status.Location.Namespace,
 		Name:      deployment.Status.Location.Name,
 	}
-	if err := r.Client.Get(ctx, locationObjectKey, &location); err != nil {
+	if err := upstreamClient.Get(ctx, locationObjectKey, &location); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching location: %w", err)
 	}
 
@@ -240,11 +244,11 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		statusChanged := apimeta.SetStatusCondition(&deployment.Status.Conditions, availableCondition)
 
 		if statusChanged {
-			err = r.Client.Status().Update(ctx, deployment)
+			err = upstreamClient.Status().Update(ctx, deployment)
 		}
 	}()
 
-	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, logger, gcpProject, r.InfraClusterNamespaceName, deployment); err != nil {
+	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, upstreamClient, gcpProject, r.InfraClusterNamespaceName, deployment); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
 	}
 
@@ -297,16 +301,16 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 	// project level role binding. Probably just pass in the service account
 	// email, otherwise we'd have to do some kind of discovery.
 
-	if err := r.reconcileConfigMaps(ctx, cloudConfig, deployment); err != nil {
+	if err := r.reconcileConfigMaps(ctx, upstreamClient, cloudConfig, deployment); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
 	}
 
-	proceed, err := r.reconcileSecrets(ctx, logger, gcpProject, r.InfraClusterNamespaceName, &availableCondition, cloudConfig, deployment, serviceAccount)
+	proceed, err := r.reconcileSecrets(ctx, upstreamClient, gcpProject, r.InfraClusterNamespaceName, &availableCondition, cloudConfig, deployment, serviceAccount)
 	if !proceed || err != nil {
 		return ctrl.Result{}, err
 	}
 
-	result, instanceTemplate, oldInstanceTemplate, err := r.reconcileInstanceTemplate(ctx, logger, gcpProject, gcpRegion, r.InfraClusterNamespaceName, &availableCondition, deployment, cloudConfig, instanceMetadata, &serviceAccount)
+	result, instanceTemplate, oldInstanceTemplate, err := r.reconcileInstanceTemplate(ctx, upstreamClient, gcpProject, gcpRegion, r.InfraClusterNamespaceName, &availableCondition, deployment, cloudConfig, instanceMetadata, &serviceAccount)
 	if !result.IsZero() || err != nil {
 		return result, err
 	}
@@ -317,7 +321,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		return ctrl.Result{}, nil
 	}
 
-	instanceGroupManager, err := r.reconcileInstanceGroupManager(ctx, logger, gcpProject, gcpZone, r.InfraClusterNamespaceName, &availableCondition, deployment, instanceTemplate)
+	instanceGroupManager, err := r.reconcileInstanceGroupManager(ctx, upstreamClient, gcpProject, gcpZone, r.InfraClusterNamespaceName, &availableCondition, deployment, instanceTemplate)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -327,7 +331,7 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 		return ctrl.Result{}, err
 	}
 
-	result, err = r.updateDeploymentStatus(ctx, logger, &availableCondition, deployment, instanceGroupManager)
+	result, err = r.updateDeploymentStatus(ctx, upstreamClient, &availableCondition, deployment, instanceGroupManager)
 	if !result.IsZero() || err != nil {
 		return result, err
 	}
@@ -346,9 +350,10 @@ func (r *WorkloadDeploymentReconciler) reconcileDeployment(
 
 func (r *WorkloadDeploymentReconciler) reconcileSandboxRuntimeDeployment(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	deployment *computev1alpha.WorkloadDeployment,
 ) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 	logger.Info("processing sandbox based workload")
 
 	runtimeSpec := deployment.Spec.Template.Spec.Runtime
@@ -527,7 +532,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSandboxRuntimeDeployment(
 
 	return r.reconcileDeployment(
 		ctx,
-		logger,
+		upstreamClient,
 		deployment,
 		cloudConfig,
 		nil,
@@ -536,10 +541,10 @@ func (r *WorkloadDeploymentReconciler) reconcileSandboxRuntimeDeployment(
 
 func (r *WorkloadDeploymentReconciler) reconcileVMRuntimeDeployment(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	deployment *computev1alpha.WorkloadDeployment,
 ) (ctrl.Result, error) {
-
+	logger := log.FromContext(ctx)
 	logger.Info("processing VM based workload")
 
 	runtimeSpec := deployment.Spec.Template.Spec.Runtime
@@ -603,7 +608,7 @@ func (r *WorkloadDeploymentReconciler) reconcileVMRuntimeDeployment(
 
 	return r.reconcileDeployment(
 		ctx,
-		logger,
+		upstreamClient,
 		deployment,
 		cloudConfig,
 		instanceMetadata,
@@ -612,11 +617,12 @@ func (r *WorkloadDeploymentReconciler) reconcileVMRuntimeDeployment(
 
 func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	gcpProject string,
 	infraClusterNamespaceName string,
 	deployment *computev1alpha.WorkloadDeployment,
 ) error {
+	logger := log.FromContext(ctx)
 	for interfaceIndex, networkInterface := range deployment.Spec.Template.Spec.NetworkInterfaces {
 		interfacePolicy := networkInterface.NetworkPolicy
 		if interfacePolicy == nil {
@@ -629,7 +635,7 @@ func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 			Name:      fmt.Sprintf("%s-net-%d", deployment.Name, interfaceIndex),
 		}
 
-		if err := r.Client.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
+		if err := upstreamClient.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
 			return fmt.Errorf("failed fetching network binding for interface: %w", err)
 		}
 
@@ -642,7 +648,7 @@ func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 			Namespace: networkBinding.Status.NetworkContextRef.Namespace,
 			Name:      networkBinding.Status.NetworkContextRef.Name,
 		}
-		if err := r.Client.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
+		if err := upstreamClient.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
 			return fmt.Errorf("failed fetching network context: %w", err)
 		}
 
@@ -747,6 +753,7 @@ func (r *WorkloadDeploymentReconciler) reconcileNetworkInterfaceNetworkPolicies(
 
 func (r *WorkloadDeploymentReconciler) reconcileConfigMaps(
 	ctx context.Context,
+	upstreamClient client.Client,
 	cloudConfig *cloudinit.CloudConfig,
 	deployment *computev1alpha.WorkloadDeployment,
 ) error {
@@ -766,7 +773,7 @@ func (r *WorkloadDeploymentReconciler) reconcileConfigMaps(
 
 	for _, configMapObjectKey := range objectKeys {
 		var configMap corev1.ConfigMap
-		if err := r.Client.Get(ctx, configMapObjectKey, &configMap); err != nil {
+		if err := upstreamClient.Get(ctx, configMapObjectKey, &configMap); err != nil {
 			return fmt.Errorf("failed to get configmap: %w", err)
 		}
 
@@ -786,7 +793,7 @@ func (r *WorkloadDeploymentReconciler) reconcileConfigMaps(
 
 func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	// TODO(jreese) consider a reconcile context that can be passed around?
 	gcpProject string,
 	infraClusterNamespaceName string,
@@ -795,6 +802,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 	deployment *computev1alpha.WorkloadDeployment,
 	serviceAccount kcciamv1beta1.IAMServiceAccount,
 ) (bool, error) {
+	logger := log.FromContext(ctx)
 	var objectKeys []client.ObjectKey
 	for _, volume := range deployment.Spec.Template.Spec.Volumes {
 		if volume.Secret != nil {
@@ -809,15 +817,13 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 		return true, nil
 	}
 
-	var secret kccsecretmanagerv1beta1.SecretManagerSecret
-
 	// Aggregate secret data into one value by creating a map of secret names
 	// to content. This will allow for mounting of keys into volumes or secrets
 	// as expected.
 	secretData := map[string]map[string][]byte{}
 	for _, objectKey := range objectKeys {
 		var k8ssecret corev1.Secret
-		if err := r.Client.Get(ctx, objectKey, &k8ssecret); err != nil {
+		if err := upstreamClient.Get(ctx, objectKey, &k8ssecret); err != nil {
 			return false, fmt.Errorf("failed fetching secret: %w", err)
 		}
 
@@ -855,6 +861,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 
 	// Create a secret in the secret manager service, grant access to the service
 	// account specific to the deployment.
+	var secret kccsecretmanagerv1beta1.SecretManagerSecret
 
 	secretObjectKey := client.ObjectKey{
 		Namespace: infraClusterNamespaceName,
@@ -997,7 +1004,7 @@ func (r *WorkloadDeploymentReconciler) reconcileSecrets(
 
 func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	// TODO(jreese) consider a reconcile context that can be passed around?
 	gcpProject string,
 	gcpRegion string,
@@ -1008,7 +1015,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 	instanceMetadata []kcccomputev1beta1.InstancetemplateMetadata,
 	serviceAccount *kcciamv1beta1.IAMServiceAccount,
 ) (ctrl.Result, *kcccomputev1beta1.ComputeInstanceTemplate, *kcccomputev1beta1.ComputeInstanceTemplate, error) {
-
+	logger := log.FromContext(ctx)
 	var instanceTemplate kcccomputev1beta1.ComputeInstanceTemplate
 	var oldInstanceTemplate kcccomputev1beta1.ComputeInstanceTemplate
 
@@ -1090,7 +1097,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceTemplate(
 			return ctrl.Result{}, nil, nil, fmt.Errorf("failed to build instance template volumes: %w", err)
 		}
 
-		result, err := r.buildInstanceTemplateNetworkInterfaces(ctx, logger, gcpProject, gcpRegion, infraClusterNamespaceName, availableCondition, deployment, &instanceTemplate)
+		result, err := r.buildInstanceTemplateNetworkInterfaces(ctx, upstreamClient, gcpProject, gcpRegion, infraClusterNamespaceName, availableCondition, deployment, &instanceTemplate)
 		if err != nil {
 			return ctrl.Result{}, nil, nil, fmt.Errorf("failed to build instance template network interfaces: %w", err)
 		} else if !result.IsZero() {
@@ -1218,7 +1225,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateVolumes(
 
 func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	// TODO(jreese) consider a reconcile context that can be passed around?
 	gcpProject string,
 	gcpRegion string,
@@ -1227,6 +1234,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 	deployment *computev1alpha.WorkloadDeployment,
 	instanceTemplate *kcccomputev1beta1.ComputeInstanceTemplate,
 ) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 	for interfaceIndex := range deployment.Spec.Template.Spec.NetworkInterfaces {
 		var networkBinding networkingv1alpha.NetworkBinding
 		networkBindingObjectKey := client.ObjectKey{
@@ -1234,7 +1242,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 			Name:      fmt.Sprintf("%s-net-%d", deployment.Name, interfaceIndex),
 		}
 
-		if err := r.Client.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
+		if err := upstreamClient.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed fetching network binding for interface: %w", err)
 		}
 
@@ -1247,7 +1255,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 			Namespace: networkBinding.Status.NetworkContextRef.Namespace,
 			Name:      networkBinding.Status.NetworkContextRef.Name,
 		}
-		if err := r.Client.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
+		if err := upstreamClient.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed fetching network context: %w", err)
 		}
 
@@ -1263,7 +1271,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 			},
 		}
 
-		if err := r.Client.List(ctx, &subnetClaims, listOpts...); err != nil {
+		if err := upstreamClient.List(ctx, &subnetClaims, listOpts...); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed fetching subnet claims: %w", err)
 		}
 
@@ -1302,7 +1310,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 				},
 			}
 
-			if err := r.Client.Create(ctx, &subnetClaim); err != nil {
+			if err := upstreamClient.Create(ctx, &subnetClaim); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed creating subnet claim: %w", err)
 			}
 
@@ -1321,7 +1329,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 			Namespace: subnetClaim.Namespace,
 			Name:      subnetClaim.Status.SubnetRef.Name,
 		}
-		if err := r.Client.Get(ctx, subnetObjectKey, &subnet); err != nil {
+		if err := upstreamClient.Get(ctx, subnetObjectKey, &subnet); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed fetching subnet: %w", err)
 		}
 
@@ -1330,6 +1338,8 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 			return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
 		}
 
+		// TODO(jreese) Update a `Programmed` condition on the subnet when the
+		// provider subnet is ready.
 		var kccSubnet kcccomputev1beta1.ComputeSubnetwork
 		kccSubnetObjectKey := client.ObjectKey{
 			Namespace: infraClusterNamespaceName,
@@ -1404,7 +1414,7 @@ func (r *WorkloadDeploymentReconciler) buildInstanceTemplateNetworkInterfaces(
 
 func (r *WorkloadDeploymentReconciler) reconcileInstanceGroupManager(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	// TODO(jreese) consider a reconcile context that can be passed around?
 	gcpProject string,
 	gcpZone string,
@@ -1413,6 +1423,7 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceGroupManager(
 	deployment *computev1alpha.WorkloadDeployment,
 	instanceTemplate *kcccomputev1beta1.ComputeInstanceTemplate,
 ) (*unstructured.Unstructured, error) {
+	logger := log.FromContext(ctx)
 	instanceGroupManagerName := fmt.Sprintf("deployment-%s", deployment.UID)
 
 	// Unstructured is used here due to bugs in type generation. We'll likely
@@ -1533,11 +1544,12 @@ func (r *WorkloadDeploymentReconciler) reconcileInstanceGroupManager(
 
 func (r *WorkloadDeploymentReconciler) updateDeploymentStatus(
 	ctx context.Context,
-	logger logr.Logger,
+	upstreamClient client.Client,
 	availableCondition *metav1.Condition,
 	deployment *computev1alpha.WorkloadDeployment,
 	instanceGroupManager *unstructured.Unstructured,
 ) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 	var requeueAfter time.Duration
 
 	currentActions, ok, err := unstructured.NestedMap(instanceGroupManager.Object, "status", "currentActions")
@@ -1655,6 +1667,16 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 	ctx context.Context,
 	obj client.Object,
 ) (finalizer.Result, error) {
+	clusterName, ok := mccontext.ClusterFrom(ctx)
+	if !ok {
+		return finalizer.Result{}, fmt.Errorf("cluster name not found in context")
+	}
+
+	cl, err := r.mgr.GetCluster(ctx, clusterName)
+	if err != nil {
+		return finalizer.Result{}, err
+	}
+
 	deployment := obj.(*computev1alpha.WorkloadDeployment)
 
 	// Delete child entities in a sequence that does not result in exponential
@@ -1705,7 +1727,7 @@ func (r *WorkloadDeploymentReconciler) Finalize(
 	// - Deployment specific secret related entities
 	// - Interface specific firewall rules
 
-	if err := crossclusterutil.DeleteAnchorForObject(ctx, r.Client, r.InfraClient, deployment, r.InfraClusterNamespaceName); err != nil {
+	if err := crossclusterutil.DeleteAnchorForObject(ctx, cl.GetClient(), r.InfraClient, deployment, r.InfraClusterNamespaceName); err != nil {
 		return finalizer.Result{}, fmt.Errorf("failed deleting instance group manager anchor: %w", err)
 	}
 
