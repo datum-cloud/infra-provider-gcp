@@ -6,8 +6,11 @@ import (
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -15,7 +18,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -53,7 +58,7 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 		return ctrl.Result{}, err
 	}
 
-	_, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), subnet.Spec.Location, r.LocationClassName)
+	location, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), subnet.Spec.Location, r.LocationClassName)
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if !shouldProcess {
@@ -80,6 +85,31 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 		return ctrl.Result{}, nil
 	}
 
+	if apimeta.IsStatusConditionTrue(subnet.Status.Conditions, networkingv1alpha.SubnetProgrammed) {
+		logger.Info("subnet is already programmed")
+		return ctrl.Result{}, nil
+	}
+
+	programmedCondition := metav1.Condition{
+		Type:               networkingv1alpha.SubnetProgrammed,
+		Status:             metav1.ConditionFalse,
+		Reason:             networkingv1alpha.SubnetProgrammedReasonNotProgrammed,
+		ObservedGeneration: subnet.Generation,
+		Message:            "Subnet has not been programmed",
+	}
+
+	defer func() {
+		if err != nil {
+			// Don't update the status if errors are encountered
+			return
+		}
+		statusChanged := apimeta.SetStatusCondition(&subnet.Status.Conditions, programmedCondition)
+
+		if statusChanged {
+			err = cl.GetClient().Status().Update(ctx, &subnet)
+		}
+	}()
+
 	logger.Info("reconciling subnet")
 	defer logger.Info("reconcile complete")
 
@@ -88,22 +118,31 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 		return ctrl.Result{}, nil
 	}
 
-	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(req.ClusterName, cl.GetClient(), r.DownstreamCluster.GetClient())
+	// Get the context the subnet is in so we can obtain the network
+	var networkContext networkingv1alpha.NetworkContext
+	if err := cl.GetClient().Get(ctx, client.ObjectKey{Namespace: subnet.Namespace, Name: subnet.Spec.NetworkContext.Name}, &networkContext); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get network context: %w", err)
+	}
 
-	downstreamClient := downstreamStrategy.GetClient()
-	downstreamSubnetObjectMeta, err := downstreamStrategy.ObjectMetaFromUpstreamObject(ctx, &subnet)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get downstream subnet object metadata: %w", err)
+	var network networkingv1alpha.Network
+	if err := cl.GetClient().Get(ctx, client.ObjectKey{Namespace: networkContext.Namespace, Name: networkContext.Spec.Network.Name}, &network); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get network: %w", err)
 	}
 
 	downstreamSubnet := &gcpcomputev1beta2.Subnetwork{
-		ObjectMeta: downstreamSubnetObjectMeta,
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("subnet-%s", subnet.UID),
+		},
 	}
 
-	result, err := controllerutil.CreateOrUpdate(ctx, downstreamClient, downstreamSubnet, func() error {
-		if err := downstreamStrategy.SetControllerReference(ctx, &subnet, downstreamSubnet); err != nil {
-			return fmt.Errorf("failed to set controller reference on downstream gateway: %w", err)
+	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), downstreamSubnet, func() error {
+		if downstreamSubnet.Annotations == nil {
+			downstreamSubnet.Annotations = make(map[string]string)
 		}
+
+		downstreamSubnet.Annotations[downstreamclient.UpstreamOwnerName] = subnet.Name
+		downstreamSubnet.Annotations[downstreamclient.UpstreamOwnerNamespace] = subnet.Namespace
+		downstreamSubnet.Annotations[downstreamclient.UpstreamOwnerClusterName] = req.ClusterName
 
 		downstreamSubnet.Spec = gcpcomputev1beta2.SubnetworkSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
@@ -114,9 +153,9 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 			ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{
 				IPCidrRange: ptr.To(fmt.Sprintf("%s/%d", *subnet.Status.StartAddress, *subnet.Status.PrefixLength)),
 				NetworkRef: &crossplanecommonv1.Reference{
-					Name: "TODO",
+					Name: fmt.Sprintf("network-%s", network.UID),
 				},
-				Region:    ptr.To("TODO"),
+				Region:    ptr.To(location.Spec.Provider.GCP.Region),
 				Purpose:   ptr.To("PRIVATE_RFC_1918"),
 				StackType: ptr.To("IPV4_ONLY"),
 			},
@@ -133,6 +172,20 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 
 	logger.Info("downstream subnet processed", "operation_result", result)
 
+	if downstreamSubnet.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+		logger.Info("GCP subnet not ready yet")
+
+		programmedCondition.Status = metav1.ConditionTrue
+		programmedCondition.Reason = networkingv1alpha.SubnetProgrammedReasonProgrammingInProgress
+		programmedCondition.Message = "Subnet is being programmed."
+
+		return ctrl.Result{}, nil
+	}
+
+	programmedCondition.Status = metav1.ConditionTrue
+	programmedCondition.Reason = networkingv1alpha.SubnetProgrammedReasonProgrammed
+	programmedCondition.Message = "Subnet is ready."
+
 	return ctrl.Result{}, nil
 }
 
@@ -140,30 +193,58 @@ func (r *SubnetReconciler) Finalize(
 	ctx context.Context,
 	obj client.Object,
 ) (finalizer.Result, error) {
+	subnet := obj.(*networkingv1alpha.Subnet)
 
-	clusterName, ok := mccontext.ClusterFrom(ctx)
-	if !ok {
-		return finalizer.Result{}, fmt.Errorf("cluster name not found in context")
+	downstreamSubnet := &gcpcomputev1beta2.Subnetwork{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("subnet-%s", subnet.UID),
+		},
 	}
 
-	cl, err := r.mgr.GetCluster(ctx, clusterName)
-	if err != nil {
-		return finalizer.Result{}, err
+	if err := r.DownstreamCluster.GetClient().Delete(ctx, downstreamSubnet); client.IgnoreNotFound(err) != nil {
+		return finalizer.Result{}, fmt.Errorf("failed to delete downstream subnet: %w", err)
 	}
-
-	_ = downstreamclient.NewMappedNamespaceResourceStrategy(clusterName, cl.GetClient(), r.DownstreamCluster.GetClient())
 
 	return finalizer.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager, downstreamCluster cluster.Cluster) error {
+func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
 	r.finalizers = finalizer.NewFinalizers()
-	r.DownstreamCluster = downstreamCluster
+	if err := r.finalizers.Register(gcpInfraFinalizer, r); err != nil {
+		return fmt.Errorf("failed to register finalizer: %w", err)
+	}
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&networkingv1alpha.Subnet{}).
+		Watches(&gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+				logger := log.FromContext(ctx)
+
+				subnet := obj.(*gcpcomputev1beta2.Subnetwork)
+				upstreamClusterName := subnet.Annotations[downstreamclient.UpstreamOwnerClusterName]
+				upstreamName := subnet.Annotations[downstreamclient.UpstreamOwnerName]
+				upstreamNamespace := subnet.Annotations[downstreamclient.UpstreamOwnerNamespace]
+
+				if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
+					logger.Info("GCP subnet is missing upstream ownership metadata")
+					return nil
+				}
+
+				return []mcreconcile.Request{
+					{
+						Request: reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: upstreamNamespace,
+								Name:      upstreamName,
+							},
+						},
+						ClusterName: upstreamClusterName,
+					},
+				}
+			})
+		}).
 		Named("subnet").
 		Complete(r)
 }

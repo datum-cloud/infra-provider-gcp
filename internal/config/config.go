@@ -33,6 +33,8 @@ type GCPProvider struct {
 	WebhookServer WebhookServerConfig `json:"webhookServer"`
 
 	Discovery DiscoveryConfig `json:"discovery"`
+
+	DownstreamResourceManagement DownstreamResourceManagementConfig `json:"downstreamResourceManagement"`
 }
 
 // +k8s:deepcopy-gen=true
@@ -197,6 +199,23 @@ func SetDefaults_TLSConfig(obj *TLSConfig) {
 	if len(obj.KeyName) == 0 {
 		obj.KeyName = "tls.key"
 	}
+}
+
+// +k8s:deepcopy-gen=true
+
+type DownstreamResourceManagementConfig struct {
+	// KubeconfigPath is the path to the kubeconfig file to use when managing
+	// downstream resources. When not provided, the operator will use the
+	// in-cluster config.
+	KubeconfigPath string `json:"kubeconfigPath"`
+}
+
+func (c *DownstreamResourceManagementConfig) RestConfig() (*rest.Config, error) {
+	if c.KubeconfigPath == "" {
+		return ctrl.GetConfig()
+	}
+
+	return clientcmd.BuildConfigFromFlags("", c.KubeconfigPath)
 }
 
 // +k8s:deepcopy-gen=true

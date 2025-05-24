@@ -94,7 +94,7 @@ func (c *mappedNamespaceResourceStrategy) ensureDownstreamNamespace(ctx context.
 			downstreamNamespace.Labels = make(map[string]string)
 		}
 
-		downstreamNamespace.Labels[UpstreamOwnerClusterNameLabel] = fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_"))
+		downstreamNamespace.Labels[UpstreamOwnerClusterName] = fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_"))
 
 		return nil
 	})
@@ -106,11 +106,11 @@ func (c *mappedNamespaceResourceStrategy) ensureDownstreamNamespace(ctx context.
 }
 
 const (
-	UpstreamOwnerClusterNameLabel = "meta.datumapis.com/upstream-cluster-name"
-	UpstreamOwnerGroupLabel       = "meta.datumapis.com/upstream-group"
-	UpstreamOwnerKindLabel        = "meta.datumapis.com/upstream-kind"
-	UpstreamOwnerNameLabel        = "meta.datumapis.com/upstream-name"
-	UpstreamOwnerNamespaceLabel   = "meta.datumapis.com/upstream-namespace"
+	UpstreamOwnerClusterName = "meta.datumapis.com/upstream-cluster-name"
+	UpstreamOwnerGroup       = "meta.datumapis.com/upstream-group"
+	UpstreamOwnerKind        = "meta.datumapis.com/upstream-kind"
+	UpstreamOwnerName        = "meta.datumapis.com/upstream-name"
+	UpstreamOwnerNamespace   = "meta.datumapis.com/upstream-namespace"
 )
 
 func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Context, owner, controlled metav1.Object, opts ...controllerutil.OwnerReferenceOption) error {
@@ -131,11 +131,11 @@ func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Con
 	anchorName := fmt.Sprintf("anchor-%s", owner.GetUID())
 
 	anchorLabels := map[string]string{
-		UpstreamOwnerClusterNameLabel: fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_")),
-		UpstreamOwnerGroupLabel:       gvk.Group,
-		UpstreamOwnerKindLabel:        gvk.Kind,
-		UpstreamOwnerNameLabel:        owner.GetName(),
-		UpstreamOwnerNamespaceLabel:   owner.GetNamespace(),
+		UpstreamOwnerClusterName: fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_")),
+		UpstreamOwnerGroup:       gvk.Group,
+		UpstreamOwnerKind:        gvk.Kind,
+		UpstreamOwnerName:        owner.GetName(),
+		UpstreamOwnerNamespace:   owner.GetNamespace(),
 	}
 
 	downstreamClient := c.GetClient()
@@ -163,11 +163,11 @@ func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Con
 		labels = map[string]string{}
 	}
 
-	labels[UpstreamOwnerClusterNameLabel] = anchorLabels[UpstreamOwnerClusterNameLabel]
-	labels[UpstreamOwnerGroupLabel] = anchorLabels[UpstreamOwnerGroupLabel]
-	labels[UpstreamOwnerKindLabel] = anchorLabels[UpstreamOwnerKindLabel]
-	labels[UpstreamOwnerNameLabel] = anchorLabels[UpstreamOwnerNameLabel]
-	labels[UpstreamOwnerNamespaceLabel] = anchorLabels[UpstreamOwnerNamespaceLabel]
+	labels[UpstreamOwnerClusterName] = anchorLabels[UpstreamOwnerClusterName]
+	labels[UpstreamOwnerGroup] = anchorLabels[UpstreamOwnerGroup]
+	labels[UpstreamOwnerKind] = anchorLabels[UpstreamOwnerKind]
+	labels[UpstreamOwnerName] = anchorLabels[UpstreamOwnerName]
+	labels[UpstreamOwnerNamespace] = anchorLabels[UpstreamOwnerNamespace]
 	controlled.SetLabels(labels)
 
 	return nil

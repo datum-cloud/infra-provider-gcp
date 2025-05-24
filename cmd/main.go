@@ -17,8 +17,11 @@ import (
 	kcccomputev1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/compute/v1beta1"
 	kcciamv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/iam/v1beta1"
 	kccsecretmanagerv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/secretmanager/v1beta1"
+	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta1 "github.com/upbound/provider-gcp/apis/compute/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
+	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
+	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -63,6 +66,9 @@ func init() {
 
 	utilruntime.Must(gcpcomputev1beta1.AddToScheme(scheme))
 	utilruntime.Must(gcpcomputev1beta2.AddToScheme(scheme))
+	utilruntime.Must(gcpcloudplatformv1beta1.AddToScheme(scheme))
+	utilruntime.Must(gcpsecretmanagerv1beta1.AddToScheme(scheme))
+	utilruntime.Must(gcpsecretmanagerv1beta2.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -174,12 +180,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// TODO(jreese) have infrastructure cluster provided by config. I think we
-	// wanted to change to use these terms: - "deployment cluster" -> where the
-	// operator is running, leadership election happens here - "downstream
-	// cluster" -> where the operator programs downstream resources - "upstream
-	// cluster" -> where resources describing intent are being programmed, such as
-	// a datum project
+	downstreamRestConfig, err := serverConfig.DownstreamResourceManagement.RestConfig()
+	if err != nil {
+		setupLog.Error(err, "unable to load control plane kubeconfig")
+		os.Exit(1)
+	}
+
+	downstreamCluster, err := cluster.New(downstreamRestConfig, func(o *cluster.Options) {
+		o.Scheme = scheme
+	})
+	if err != nil {
+		setupLog.Error(err, "failed to construct cluster")
+		os.Exit(1)
+	}
 
 	// if err = (&controller.WorkloadDeploymentReconciler{
 	// 	InfraClient:               mgr.GetLocalManager().GetClient(),
@@ -199,26 +212,34 @@ func main() {
 
 	if err = (&controller.InstanceReconciler{
 		LocationClassName: locationClassName,
-	}).SetupWithManager(mgr, mgr.GetLocalManager()); err != nil {
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InstanceReconciler")
 		os.Exit(1)
 	}
 
 	if err = (&controller.SubnetReconciler{
 		LocationClassName: locationClassName,
-	}).SetupWithManager(mgr, mgr.GetLocalManager()); err != nil {
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SubnetReconciler")
 		os.Exit(1)
 	}
 
 	if err = (&controller.NetworkContextReconciler{
 		LocationClassName: locationClassName,
-	}).SetupWithManager(mgr, mgr.GetLocalManager()); err != nil {
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
 		os.Exit(1)
 	}
 
 	// +kubebuilder:scaffold:builder
+
+	if err = controller.AddIndexers(ctx, mgr); err != nil {
+		setupLog.Error(err, "unable to add indexers")
+		os.Exit(1)
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -239,6 +260,10 @@ func main() {
 	setupLog.Info("starting cluster discovery provider")
 	g.Go(func() error {
 		return ignoreCanceled(provider.Run(ctx, mgr))
+	})
+
+	g.Go(func() error {
+		return ignoreCanceled(downstreamCluster.Start(ctx))
 	})
 
 	setupLog.Info("starting multicluster manager")

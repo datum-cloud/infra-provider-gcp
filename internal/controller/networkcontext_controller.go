@@ -12,13 +12,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/finalizer"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -33,7 +35,6 @@ import (
 // ComputeNetwork is created to represent the context within GCP.
 type NetworkContextReconciler struct {
 	mgr               mcmanager.Manager
-	finalizers        finalizer.Finalizers
 	DownstreamCluster cluster.Cluster
 	LocationClassName string
 }
@@ -73,17 +74,6 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 	logger.Info("reconciling network context")
 	defer logger.Info("reconcile complete")
 
-	finalizationResult, err := r.finalizers.Finalize(ctx, &networkContext)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to finalize: %w", err)
-	}
-	if finalizationResult.Updated {
-		if err = cl.GetClient().Update(ctx, &networkContext); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to update based on finalization result: %w", err)
-		}
-		return ctrl.Result{}, nil
-	}
-
 	if !networkContext.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
@@ -98,7 +88,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		Status:             metav1.ConditionFalse,
 		Reason:             networkingv1alpha.NetworkContextProgrammedReasonNotProgrammed,
 		ObservedGeneration: networkContext.Generation,
-		Message:            "Network is not ready",
+		Message:            "Network has not been programmed",
 	}
 
 	defer func() {
@@ -122,24 +112,32 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		return ctrl.Result{}, fmt.Errorf("failed fetching network: %w", err)
 	}
 
-	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(req.ClusterName, cl.GetClient(), r.DownstreamCluster.GetClient())
-
-	downstreamClient := downstreamStrategy.GetClient()
-	downstreamNetworkObjectMeta, err := downstreamStrategy.ObjectMetaFromUpstreamObject(ctx, &network)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get downstream network object metadata: %w", err)
-	}
-
-	downstreamNetworkObjectMeta.Name = fmt.Sprintf("network-%s", network.UID)
-
+	// Note!!!
+	//
+	// Crossplane v1 managed resources are cluster scoped! We don't want
+	// to deal with the creation of Composite Resource Definitions, Composite
+	// Resources, or Claims. As a result, the resource name needs to be globally
+	// unique.
+	//
+	// In Crossplane v2, which is currently in preview, managed resources will
+	// also be available as namespaced resources. Unfortunately the preview does
+	// not include modifications to the GCP provider.
+	//
+	// If we want the name to be used for the resource at the provider to differ
+	// from this resource name, use the following annotation:
+	// crossplanemeta.AnnotationKeyExternalName (crossplane.io/external-name)
 	downstreamNetwork := &gcpcomputev1beta1.Network{
-		ObjectMeta: downstreamNetworkObjectMeta,
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("network-%s", network.UID),
+		},
 	}
 
-	result, err := controllerutil.CreateOrUpdate(ctx, downstreamClient, downstreamNetwork, func() error {
-		if err := downstreamStrategy.SetControllerReference(ctx, &network, downstreamNetwork); err != nil {
-			return fmt.Errorf("failed to set controller reference on downstream network: %w", err)
+	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), downstreamNetwork, func() error {
+		if downstreamNetwork.Annotations == nil {
+			downstreamNetwork.Annotations = make(map[string]string)
 		}
+
+		downstreamNetwork.Annotations[downstreamclient.UpstreamOwnerClusterName] = req.ClusterName
 
 		downstreamNetwork.Spec = gcpcomputev1beta1.NetworkSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
@@ -167,6 +165,11 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 
 	if downstreamNetwork.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("GCP network not ready yet")
+
+		programmedCondition.Status = metav1.ConditionTrue
+		programmedCondition.Reason = networkingv1alpha.NetworkContextProgrammedReasonProgrammingInProgress
+		programmedCondition.Message = "Network is being programmed."
+
 		return ctrl.Result{}, nil
 	}
 
@@ -177,38 +180,56 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 	return ctrl.Result{}, nil
 }
 
-func (r *NetworkContextReconciler) Finalize(
-	ctx context.Context,
-	obj client.Object,
-) (finalizer.Result, error) {
-
-	clusterName, ok := mccontext.ClusterFrom(ctx)
-	if !ok {
-		return finalizer.Result{}, fmt.Errorf("cluster name not found in context")
-	}
-
-	cl, err := r.mgr.GetCluster(ctx, clusterName)
-	if err != nil {
-		return finalizer.Result{}, err
-	}
-
-	_ = cl
-	// TODO
-
-	return finalizer.Result{}, nil
-}
-
 // SetupWithManager sets up the controller with the Manager.
-func (r *NetworkContextReconciler) SetupWithManager(mgr mcmanager.Manager, downstreamCluster cluster.Cluster) error {
+func (r *NetworkContextReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
-	r.DownstreamCluster = downstreamCluster
-	r.finalizers = finalizer.NewFinalizers()
-	if err := r.finalizers.Register(gcpInfraFinalizer, r); err != nil {
-		return fmt.Errorf("failed to register finalizer: %w", err)
-	}
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&networkingv1alpha.NetworkContext{}, mcbuilder.WithEngageWithLocalCluster(false)).
-		Owns(&gcpcomputev1beta1.Network{}, mcbuilder.WithEngageWithLocalCluster(false)).
+		Watches(&gcpcomputev1beta1.Network{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+				logger := log.FromContext(ctx)
+
+				network := obj.(*gcpcomputev1beta1.Network)
+				upstreamClusterName := network.Annotations[downstreamclient.UpstreamOwnerClusterName]
+
+				if upstreamClusterName == "" {
+					logger.Info("GCP network is missing upstream ownership metadata")
+					return nil
+				}
+
+				cluster, err := mgr.GetCluster(ctx, upstreamClusterName)
+				if err != nil {
+					logger.Error(err, "failed to get upstream cluster")
+					return nil
+				}
+				clusterClient := cluster.GetClient()
+
+				listOpts := client.MatchingFields{
+					networkContextControllerNetworkUIDIndex: network.GetName(),
+				}
+
+				var networkContexts networkingv1alpha.NetworkContextList
+				if err := clusterClient.List(ctx, &networkContexts, listOpts); err != nil {
+					logger.Error(err, "failed to list network contexts")
+					return nil
+				}
+
+				var requests []mcreconcile.Request
+				for _, networkContext := range networkContexts.Items {
+					requests = append(requests, mcreconcile.Request{
+						Request: reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: networkContext.Namespace,
+								Name:      networkContext.Name,
+							},
+						},
+						ClusterName: clusterName,
+					})
+				}
+
+				return requests
+			})
+		}, mcbuilder.WithEngageWithLocalCluster(false)).
 		Complete(r)
 }
