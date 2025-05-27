@@ -40,6 +40,7 @@ import (
 
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
+	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
@@ -116,12 +117,12 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return ctrl.Result{}, nil
 	}
 
-	// if apimeta.IsStatusConditionTrue(instance.Status.Conditions, computev1alpha.InstanceProgrammed) {
-	// 	if instance.Status.Controller != nil && instance.Spec.Controller.TemplateHash == instance.Status.Controller.ObservedTemplateHash {
-	// 		logger.Info("instance is already programmed")
-	// 		return ctrl.Result{}, nil
-	// 	}
-	// }
+	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, computev1alpha.InstanceProgrammed) {
+		if instance.Status.Controller != nil && instance.Spec.Controller.TemplateHash == instance.Status.Controller.ObservedTemplateHash {
+			logger.Info("instance is already programmed")
+			return ctrl.Result{}, nil
+		}
+	}
 
 	workloadDeploymentRef := metav1.GetControllerOf(&instance)
 	if workloadDeploymentRef == nil {
@@ -191,7 +192,7 @@ func (r *InstanceReconciler) reconcileInstance(
 	programmedCondition := metav1.Condition{
 		Type:               computev1alpha.InstanceProgrammed,
 		Status:             metav1.ConditionFalse,
-		Reason:             "InstanceResourcesNotReady",
+		Reason:             computev1alpha.InstanceProgrammedReasonPendingProgramming,
 		ObservedGeneration: instance.Generation,
 		Message:            "Instance resources are not ready",
 	}
@@ -203,12 +204,11 @@ func (r *InstanceReconciler) reconcileInstance(
 			// Don't update the status if errors are encountered
 			return
 		}
-		_ = apimeta.SetStatusCondition(&instance.Status.Conditions, programmedCondition)
+		statusChanged := apimeta.SetStatusCondition(&instance.Status.Conditions, programmedCondition)
 
-		upstreamClient.Status().Update(ctx, instance)
-		// if statusChanged {
-		// 	err = upstreamClient.Status().Update(ctx, instance)
-		// }
+		if statusChanged {
+			err = upstreamClient.Status().Update(ctx, instance)
+		}
 	}()
 
 	// TODO
@@ -238,7 +238,13 @@ func (r *InstanceReconciler) reconcileInstance(
 			ObjectMeta: metav1.ObjectMeta{
 				Name: serviceAccountObjectKey.Name,
 				Annotations: map[string]string{
-					crossplanemeta.AnnotationKeyExternalName: fmt.Sprintf("workload-%d", h.Sum32()),
+					downstreamclient.UpstreamOwnerName:        workload.Name,
+					downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+					downstreamclient.UpstreamOwnerClusterName: clusterName,
+					crossplanemeta.AnnotationKeyExternalName:  fmt.Sprintf("workload-%d", h.Sum32()),
+				},
+				Labels: map[string]string{
+					computev1alpha.WorkloadUIDLabel: string(workload.UID),
 				},
 			},
 			Spec: gcpcloudplatformv1beta1.ServiceAccountSpec{
@@ -260,7 +266,8 @@ func (r *InstanceReconciler) reconcileInstance(
 
 	if serviceAccount.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("service account not ready yet")
-		programmedCondition.Reason = "ServiceAccountNotReady"
+		programmedCondition.Reason = "ProvisioningServiceAccount"
+		programmedCondition.Message = "Service account is being provisioned for the workload"
 		return ctrl.Result{}, nil
 	}
 
@@ -274,7 +281,16 @@ func (r *InstanceReconciler) reconcileInstance(
 		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
 	}
 
-	proceed, err := r.reconcileSecrets(ctx, upstreamClient, &programmedCondition, cloudConfig, workload, instance, serviceAccount)
+	proceed, err := r.reconcileSecrets(
+		ctx,
+		clusterName,
+		upstreamClient,
+		&programmedCondition,
+		cloudConfig,
+		workload,
+		instance,
+		serviceAccount,
+	)
 	if !proceed || err != nil {
 		return ctrl.Result{}, err
 	}
@@ -297,13 +313,17 @@ func (r *InstanceReconciler) reconcileInstance(
 
 	if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("GCP instance not ready yet")
-		programmedCondition.Reason = "GCPInstanceNotReady"
+		programmedCondition.Reason = "ProvisioningProviderInstance"
+		programmedCondition.Message = "GCP instance is being provisioned"
+
 		return ctrl.Result{}, nil
 	}
 
+	// TODO(jreese) Reconcile power state
+
 	programmedCondition.Status = metav1.ConditionTrue
-	programmedCondition.Reason = "InstanceResourcesReady"
-	programmedCondition.Message = "Instance resources are ready"
+	programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
+	programmedCondition.Message = "Instance has been programmed"
 	instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
 		ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
 	}
@@ -649,6 +669,7 @@ func (r *InstanceReconciler) buildConfigMaps(
 
 func (r *InstanceReconciler) reconcileSecrets(
 	ctx context.Context,
+	clusterName string,
 	upstreamClient client.Client,
 	programmedCondition *metav1.Condition,
 	cloudConfig *cloudinit.CloudConfig,
@@ -710,6 +731,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 	// Create a secret in the secret manager service, grant access to the service
 	// account specific to the deployment.
+	// TODO(jreese) handle updates
 	var secret gcpsecretmanagerv1beta2.Secret
 
 	secretObjectKey := client.ObjectKey{
@@ -720,9 +742,18 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	if secret.CreationTimestamp.IsZero() {
+		// TODO(jreese) have this owned by the workload
 		secret = gcpsecretmanagerv1beta2.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: secretObjectKey.Name,
+				Annotations: map[string]string{
+					downstreamclient.UpstreamOwnerName:        workload.Name,
+					downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+					downstreamclient.UpstreamOwnerClusterName: clusterName,
+				},
+				Labels: map[string]string{
+					computev1alpha.WorkloadUIDLabel: string(workload.UID),
+				},
 			},
 			Spec: gcpsecretmanagerv1beta2.SecretSpec{
 				ResourceSpec: crossplanecommonv1.ResourceSpec{
@@ -745,7 +776,8 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 	if secret.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("secret not ready yet")
-		programmedCondition.Reason = "SecretNotReady"
+		programmedCondition.Reason = "ProvisioningSecret"
+		programmedCondition.Message = "Secret is being provisioned for the workload"
 		return false, nil
 	}
 
@@ -788,14 +820,31 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), secretVersion, func() error {
+		if controllerutil.SetOwnerReference(&secret, secretVersion, r.DownstreamCluster.GetClient().Scheme()) != nil {
+			return fmt.Errorf("failed to set owner reference on secret version: %w", err)
+		}
+
+		if secretVersion.Annotations == nil {
+			secretVersion.Annotations = make(map[string]string)
+		}
+
+		if secretVersion.Labels == nil {
+			secretVersion.Labels = make(map[string]string)
+		}
+
+		secretVersion.Annotations[downstreamclient.UpstreamOwnerName] = workload.Name
+		secretVersion.Annotations[downstreamclient.UpstreamOwnerNamespace] = workload.Namespace
+		secretVersion.Annotations[downstreamclient.UpstreamOwnerClusterName] = clusterName
+
+		secretVersion.Labels[computev1alpha.WorkloadUIDLabel] = string(workload.UID)
+
 		secretVersion.Spec = gcpsecretmanagerv1beta1.SecretVersionSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
-				ProviderConfigReference: &crossplanecommonv1.Reference{
-					Name: "project-test-fz3pr6", // TODO
-				},
+				ProviderConfigReference: secret.Spec.ResourceSpec.ProviderConfigReference,
 			},
 			ForProvider: gcpsecretmanagerv1beta1.SecretVersionParameters{
-				Enabled: ptr.To(true),
+				Enabled:        ptr.To(true),
+				DeletionPolicy: ptr.To("DELETE"),
 				SecretDataSecretRef: crossplanecommonv1.SecretKeySelector{
 					Key: "secretData",
 					SecretReference: crossplanecommonv1.SecretReference{
@@ -816,6 +865,13 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	logger.Info("downstream secret version processed", "operation_result", result)
+
+	if secretVersion.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+		logger.Info("secret version not ready yet")
+		programmedCondition.Reason = "ProvisioningSecretVersion"
+		programmedCondition.Message = "Secret version is being provisioned for the workload"
+		return false, nil
+	}
 
 	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
 		Encoding:    "b64",
@@ -1123,6 +1179,26 @@ func (r *InstanceReconciler) Finalize(
 	ctx context.Context,
 	obj client.Object,
 ) (finalizer.Result, error) {
+	logger := log.FromContext(ctx)
+	instance := obj.(*computev1alpha.Instance)
+
+	gcpInstance := &gcpcomputev1beta2.Instance{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("instance-%s", instance.UID),
+		},
+	}
+
+	if err := r.DownstreamCluster.GetClient().Delete(ctx, gcpInstance); client.IgnoreNotFound(err) != nil {
+		return finalizer.Result{}, fmt.Errorf("failed to delete downstream instance: %w", err)
+	}
+
+	// TODO(jreese) wait for the instance to be deleted, need to move away from
+	// the finalizer interface from controller-runtime to wait without passing
+	// errors around.
+
+	// Finalize secrets, service accounts, at a workload level.
+
+	logger.Info("downstream instance deleted")
 
 	return finalizer.Result{}, nil
 }
@@ -1135,11 +1211,12 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		return fmt.Errorf("failed to register finalizer: %w", err)
 	}
 
-	// TODO(jreese) watch :allthethings:
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&computev1alpha.Instance{}).
+		Watches(&gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr)).
+		Watches(&gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr)).
+		Watches(&gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr)).
 		Watches(&gcpcomputev1beta2.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-			// TODO(jreese) generalize this function
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 
