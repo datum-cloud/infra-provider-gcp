@@ -15,6 +15,7 @@ import (
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
 	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
+	gcpv1beta1 "github.com/upbound/provider-gcp/apis/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -22,14 +23,12 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	k8sjson "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/apimachinery/pkg/types"
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -47,6 +46,7 @@ import (
 )
 
 const gcpWorkloadFinalizer = "compute.datumapis.com/gcp-workload-controller"
+const crossplaneFinalizer = "finalizer.managedresource.crossplane.io"
 
 var errResourceIsDeleting = errors.New("resource is deleting")
 
@@ -54,10 +54,16 @@ var errResourceIsDeleting = errors.New("resource is deleting")
 // GCP
 type InstanceReconciler struct {
 	mgr               mcmanager.Manager
-	finalizers        finalizer.Finalizers
 	LocationClassName string
 	DownstreamCluster cluster.Cluster
 }
+
+// +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances,verbs=get;list;watch
+// +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances/finalizers,verbs=update
+// TODO(jreese) Additional RBAC for referenced resources
+
+// TODO(jreese) RBAC for Crossplane resources
 
 func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -89,32 +95,35 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return ctrl.Result{}, nil
 	}
 
-	finalizationResult, err := r.finalizers.Finalize(ctx, &instance)
-	if err != nil {
-		if v, ok := err.(kerrors.Aggregate); ok && v.Is(errResourceIsDeleting) {
-			logger.Info("instance still has resources in GCP, waiting until removal")
-			return ctrl.Result{}, nil
-		} else {
-			return ctrl.Result{}, fmt.Errorf("failed to finalize: %w", err)
-		}
-	}
-	if finalizationResult.Updated {
-		if err = cl.GetClient().Update(ctx, &instance); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to update based on finalization result: %w", err)
-		}
-		return ctrl.Result{}, nil
-	}
-
-	if !instance.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, nil
-	}
-
 	logger.Info("reconciling instance")
 	defer logger.Info("reconcile complete")
+
+	if !instance.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(&instance, gcpInfraFinalizer) {
+			return ctrl.Result{}, r.Finalize(ctx, cl.GetClient(), &instance)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(&instance, gcpInfraFinalizer) {
+		controllerutil.AddFinalizer(&instance, gcpInfraFinalizer)
+		if err := cl.GetClient().Update(ctx, &instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	if len(instance.Spec.Controller.SchedulingGates) > 0 {
 		logger.Info("instance has scheduling gates, waiting until they are removed", "scheduling_gates", instance.Spec.Controller.SchedulingGates)
 		return ctrl.Result{}, nil
+	}
+
+	// Fetch the ProviderConfig that will be used for Crossplane GCP resources
+	var providerConfig gcpv1beta1.ProviderConfig
+	if err := cl.GetClient().Get(ctx, client.ObjectKey{
+		Name: "project-test-fz3pr6", // TODO
+	}, &providerConfig); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching provider config: %w", err)
 	}
 
 	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, computev1alpha.InstanceProgrammed) {
@@ -155,9 +164,9 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 
 	runtime := instance.Spec.Runtime
 	if runtime.Sandbox != nil {
-		return r.reconcileSandboxRuntimeInstance(ctx, req.ClusterName, cl.GetClient(), &workload, &workloadDeployment, &instance)
+		return r.reconcileSandboxRuntimeInstance(ctx, req.ClusterName, providerConfig, cl.GetClient(), &workload, &workloadDeployment, &instance)
 	} else if runtime.VirtualMachine != nil {
-		return r.reconcileVMRuntimeInstance(ctx, req.ClusterName, cl.GetClient(), &workload, &workloadDeployment, &instance)
+		return r.reconcileVMRuntimeInstance(ctx, req.ClusterName, providerConfig, cl.GetClient(), &workload, &workloadDeployment, &instance)
 	}
 
 	return ctrl.Result{}, nil
@@ -166,6 +175,7 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 func (r *InstanceReconciler) reconcileInstance(
 	ctx context.Context,
 	clusterName string,
+	providerConfig gcpv1beta1.ProviderConfig,
 	upstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -197,17 +207,9 @@ func (r *InstanceReconciler) reconcileInstance(
 		Message:            "Instance resources are not ready",
 	}
 
-	// TODO(jreese) sync power state
-
 	defer func() {
-		if err != nil {
-			// Don't update the status if errors are encountered
-			return
-		}
-		statusChanged := apimeta.SetStatusCondition(&instance.Status.Conditions, programmedCondition)
-
-		if statusChanged {
-			err = upstreamClient.Status().Update(ctx, instance)
+		if apimeta.SetStatusCondition(&instance.Status.Conditions, programmedCondition) {
+			err = errors.Join(err, upstreamClient.Status().Update(ctx, instance))
 		}
 	}()
 
@@ -216,14 +218,12 @@ func (r *InstanceReconciler) reconcileInstance(
 	// 	return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
 	// }
 
-	// TODO(jreese) consider moving this out of the instance controller and into
-	// one that handles workload scoped resources.
-
 	// Service account names cannot exceed 30 characters
 	// TODO(jreese) move to base36, as the underlying bytes won't be lost
 	h := fnv.New32a()
 	h.Write([]byte(workload.UID))
 
+	// NOTE: This is garbage collected in the workload controller.
 	var serviceAccount gcpcloudplatformv1beta1.ServiceAccount
 	serviceAccountObjectKey := client.ObjectKey{
 		Name: fmt.Sprintf("workload-%s", workload.UID),
@@ -232,8 +232,17 @@ func (r *InstanceReconciler) reconcileInstance(
 		return ctrl.Result{}, fmt.Errorf("failed fetching workload's service account: %w", err)
 	}
 
+	// NOTE: We do not wait for the service account to be ready, as the underlying
+	// Terraform provider has a `time.Sleep(10 * time.Second)` in the create path.
+	// See: https://github.com/hashicorp/terraform-provider-google/blob/092c36f3857a8ca0291dd3992f72357cabd45dc7/google/services/resourcemanager/resource_google_service_account.go#L181-L184
+	//
+	// In testing, the service account is created and ready in less than a second.
+	// In the case that it's not ready, the system will retry until it is.
+	//
+	// We do, however, wait for the Crossplane `AnnotationKeyExternalCreateSucceeded`
+	// annotation to show up, to ensure the action has been issued prior to trying
+	// to create the instance.
 	if serviceAccount.CreationTimestamp.IsZero() {
-		// TODO(jreese) have this owned by the workload
 		serviceAccount = gcpcloudplatformv1beta1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: serviceAccountObjectKey.Name,
@@ -249,8 +258,12 @@ func (r *InstanceReconciler) reconcileInstance(
 			},
 			Spec: gcpcloudplatformv1beta1.ServiceAccountSpec{
 				ResourceSpec: crossplanecommonv1.ResourceSpec{
+					ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+						crossplanecommonv1.ManagementActionAll,
+					},
+					DeletionPolicy: crossplanecommonv1.DeletionDelete,
 					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: "project-test-fz3pr6", // TODO
+						Name: providerConfig.Name,
 					},
 				},
 				ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
@@ -264,15 +277,18 @@ func (r *InstanceReconciler) reconcileInstance(
 		}
 	}
 
-	if serviceAccount.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("service account not ready yet")
-		programmedCondition.Reason = "ProvisioningServiceAccount"
-		programmedCondition.Message = "Service account is being provisioned for the workload"
-		return ctrl.Result{}, nil
+	// See if there's been a failure to create the service account.
+	if condition := serviceAccount.Status.GetCondition("LastAsyncOperation"); condition.Reason == "AsyncCreateFailure" {
+		logger.Info("service account failed to create")
+		programmedCondition.Reason = "ServiceAccountFailedToCreate"
+		// TODO(jreese) should we only pass this through for locations in the same
+		// datum project (cluster for multicluster-runtime) as the instance?
+		programmedCondition.Message = fmt.Sprintf("Service account failed to create: %s", condition.Message)
+		return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
 	}
 
 	// TODO(jreese) add IAM Policy to the GCP service account to allow the service
-	// account used by k8s-config-connector the `roles/iam.serviceAccountUser` role,
+	// account used by Crossplane the `roles/iam.serviceAccountUser` role,
 	// so that it can create instances with the service account without needing a
 	// project level role binding. Probably just pass in the service account
 	// email, otherwise we'd have to do some kind of discovery.
@@ -284,6 +300,7 @@ func (r *InstanceReconciler) reconcileInstance(
 	proceed, err := r.reconcileSecrets(
 		ctx,
 		clusterName,
+		providerConfig,
 		upstreamClient,
 		&programmedCondition,
 		cloudConfig,
@@ -295,9 +312,20 @@ func (r *InstanceReconciler) reconcileInstance(
 		return ctrl.Result{}, err
 	}
 
+	// It's unlikely that we will hit this condition, as we wait for secrets
+	// above to be ready and return early if they are not. However, it's good to
+	// check.
+	if _, ok := serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalCreateSucceeded]; !ok {
+		logger.Info("service account not created yet", "service_account", serviceAccount.Name)
+		programmedCondition.Reason = "ProvisioningServiceAccount"
+		programmedCondition.Message = "Service account is being provisioned for the workload"
+		return ctrl.Result{}, nil
+	}
+
 	result, gcpInstance, err := r.reconcileGCPInstance(
 		ctx,
 		clusterName,
+		providerConfig,
 		upstreamClient,
 		gcpZone,
 		workload,
@@ -318,8 +346,6 @@ func (r *InstanceReconciler) reconcileInstance(
 
 		return ctrl.Result{}, nil
 	}
-
-	// TODO(jreese) Reconcile power state
 
 	programmedCondition.Status = metav1.ConditionTrue
 	programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
@@ -354,6 +380,7 @@ func (r *InstanceReconciler) reconcileInstance(
 func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
+	providerConfig gcpv1beta1.ProviderConfig,
 	client client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -539,6 +566,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	return r.reconcileInstance(
 		ctx,
 		clusterName,
+		providerConfig,
 		client,
 		workload,
 		workloadDeployment,
@@ -551,6 +579,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
+	providerConfig gcpv1beta1.ProviderConfig,
 	client client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -618,6 +647,7 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	return r.reconcileInstance(
 		ctx,
 		clusterName,
+		providerConfig,
 		client,
 		workload,
 		workloadDeployment,
@@ -670,6 +700,7 @@ func (r *InstanceReconciler) buildConfigMaps(
 func (r *InstanceReconciler) reconcileSecrets(
 	ctx context.Context,
 	clusterName string,
+	providerConfig gcpv1beta1.ProviderConfig,
 	upstreamClient client.Client,
 	programmedCondition *metav1.Condition,
 	cloudConfig *cloudinit.CloudConfig,
@@ -710,13 +741,25 @@ func (r *InstanceReconciler) reconcileSecrets(
 		return false, fmt.Errorf("failed to marshal secret data")
 	}
 
+	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(clusterName, upstreamClient, r.DownstreamCluster.GetClient())
+	downstreamClient := downstreamStrategy.GetClient()
+
+	downstreamNamespaceName, err := downstreamStrategy.GetDownstreamNamespaceName(ctx, instance)
+	if err != nil {
+		return false, fmt.Errorf("failed to get downstream namespace name: %w", err)
+	}
+
+	// NOTE: This is garbage collected in the workload controller.
 	aggregatedK8sSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
+			Namespace: downstreamNamespaceName,
 			Name:      fmt.Sprintf("workload-%s", workload.UID),
 		},
 	}
-	_, err = controllerutil.CreateOrUpdate(ctx, r.DownstreamCluster.GetClient(), aggregatedK8sSecret, func() error {
+	_, err = controllerutil.CreateOrUpdate(ctx, downstreamClient, aggregatedK8sSecret, func() error {
+		if err := downstreamStrategy.SetControllerReference(ctx, workload, aggregatedK8sSecret); err != nil {
+			return fmt.Errorf("failed to set owner reference on aggregated k8s secret: %w", err)
+		}
 
 		aggregatedK8sSecret.Data = map[string][]byte{
 			"secretData": secretBytes,
@@ -731,9 +774,9 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 	// Create a secret in the secret manager service, grant access to the service
 	// account specific to the deployment.
-	// TODO(jreese) handle updates
-	var secret gcpsecretmanagerv1beta2.Secret
 
+	// NOTE: This is garbage collected in the workload controller.
+	var secret gcpsecretmanagerv1beta2.Secret
 	secretObjectKey := client.ObjectKey{
 		Name: fmt.Sprintf("workload-%s", workload.UID),
 	}
@@ -742,7 +785,6 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	if secret.CreationTimestamp.IsZero() {
-		// TODO(jreese) have this owned by the workload
 		secret = gcpsecretmanagerv1beta2.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: secretObjectKey.Name,
@@ -757,8 +799,12 @@ func (r *InstanceReconciler) reconcileSecrets(
 			},
 			Spec: gcpsecretmanagerv1beta2.SecretSpec{
 				ResourceSpec: crossplanecommonv1.ResourceSpec{
+					ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+						crossplanecommonv1.ManagementActionAll,
+					},
+					DeletionPolicy: crossplanecommonv1.DeletionDelete,
 					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: "project-test-fz3pr6", // TODO
+						Name: providerConfig.Name,
 					},
 				},
 				ForProvider: gcpsecretmanagerv1beta2.SecretParameters{
@@ -775,7 +821,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	if secret.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("secret not ready yet")
+		logger.Info("secret not ready yet", "secret", secret.Name)
 		programmedCondition.Reason = "ProvisioningSecret"
 		programmedCondition.Message = "Secret is being provisioned for the workload"
 		return false, nil
@@ -786,33 +832,9 @@ func (r *InstanceReconciler) reconcileSecrets(
 		return false, fmt.Errorf("failed fetching secret's IAM policy: %w", err)
 	}
 
-	if secretIAMPolicy.CreationTimestamp.IsZero() {
-		secretIAMPolicy = gcpsecretmanagerv1beta2.SecretIAMMember{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: secret.Namespace,
-				Name:      secret.Name,
-			},
-			Spec: gcpsecretmanagerv1beta2.SecretIAMMemberSpec{
-				ResourceSpec: crossplanecommonv1.ResourceSpec{
-					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: "project-test-fz3pr6", // TODO
-					},
-				},
-				ForProvider: gcpsecretmanagerv1beta2.SecretIAMMemberParameters{
-					Role:   ptr.To("roles/secretmanager.secretAccessor"),
-					Member: ptr.To(*serviceAccount.Status.AtProvider.Email),
-				},
-			},
-		}
-
-		if err := r.DownstreamCluster.GetClient().Create(ctx, &secretIAMPolicy); err != nil {
-			return false, fmt.Errorf("failed setting IAM policy on secret: %w", err)
-		}
-	}
-
 	// Store secret information in the secret version
-	// TODO(jreese) handle updates to secrets - use Generation from aggregated
-	// secret manifest?
+	// TODO(jreese) handle updates to secrets - this needs to be done by creating
+	// a new secret version.
 	secretVersion := &gcpsecretmanagerv1beta1.SecretVersion{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: secret.Name,
@@ -840,11 +862,19 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 		secretVersion.Spec = gcpsecretmanagerv1beta1.SecretVersionSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
+				ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+					crossplanecommonv1.ManagementActionAll,
+				},
+				DeletionPolicy:          crossplanecommonv1.DeletionDelete,
 				ProviderConfigReference: secret.Spec.ResourceSpec.ProviderConfigReference,
 			},
 			ForProvider: gcpsecretmanagerv1beta1.SecretVersionParameters{
 				Enabled:        ptr.To(true),
 				DeletionPolicy: ptr.To("DELETE"),
+				// This is self referencing toward the value in the spec prior to
+				// assignment of our desired state, as Crossplane mutates this value
+				// when resolving the SecretRef value.
+				Secret: secretVersion.Spec.ForProvider.Secret,
 				SecretDataSecretRef: crossplanecommonv1.SecretKeySelector{
 					Key: "secretData",
 					SecretReference: crossplanecommonv1.SecretReference{
@@ -867,7 +897,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	logger.Info("downstream secret version processed", "operation_result", result)
 
 	if secretVersion.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("secret version not ready yet")
+		logger.Info("secret version not ready yet", "secret", secret.Name, "secret_version", secretVersion.Name)
 		programmedCondition.Reason = "ProvisioningSecretVersion"
 		programmedCondition.Message = "Secret version is being provisioned for the workload"
 		return false, nil
@@ -886,12 +916,45 @@ func (r *InstanceReconciler) reconcileSecrets(
 		fmt.Sprintf("/etc/secrets/populate_secrets.py https://secretmanager.googleapis.com/v1/%s/versions/latest:access", *secret.Status.AtProvider.Name),
 	)
 
+	if secretIAMPolicy.CreationTimestamp.IsZero() {
+		secretIAMPolicy = gcpsecretmanagerv1beta2.SecretIAMMember{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: secret.Namespace,
+				Name:      secret.Name,
+			},
+			Spec: gcpsecretmanagerv1beta2.SecretIAMMemberSpec{
+				ResourceSpec: crossplanecommonv1.ResourceSpec{
+					ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+						crossplanecommonv1.ManagementActionAll,
+					},
+					DeletionPolicy: crossplanecommonv1.DeletionDelete,
+					ProviderConfigReference: &crossplanecommonv1.Reference{
+						Name: providerConfig.Name,
+					},
+				},
+				ForProvider: gcpsecretmanagerv1beta2.SecretIAMMemberParameters{
+					Role:   ptr.To("roles/secretmanager.secretAccessor"),
+					Member: ptr.To(fmt.Sprintf("%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], providerConfig.Spec.ProjectID)),
+				},
+			},
+		}
+
+		if err := controllerutil.SetOwnerReference(&secret, &secretIAMPolicy, r.DownstreamCluster.GetClient().Scheme()); err != nil {
+			return false, fmt.Errorf("failed to set owner reference on secret IAM policy: %w", err)
+		}
+
+		if err := r.DownstreamCluster.GetClient().Create(ctx, &secretIAMPolicy); err != nil {
+			return false, fmt.Errorf("failed setting IAM policy on secret: %w", err)
+		}
+	}
+
 	return true, nil
 }
 
 func (r *InstanceReconciler) reconcileGCPInstance(
 	ctx context.Context,
 	clusterName string,
+	providerConfig gcpv1beta1.ProviderConfig,
 	upstreamClient client.Client,
 	gcpZone string,
 	workload *computev1alpha.Workload,
@@ -917,6 +980,10 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 			gcpInstance.Annotations = make(map[string]string)
 		}
 
+		if !controllerutil.ContainsFinalizer(gcpInstance, gcpInfraFinalizer) {
+			controllerutil.AddFinalizer(gcpInstance, gcpInfraFinalizer)
+		}
+
 		gcpInstance.Annotations[downstreamclient.UpstreamOwnerName] = instance.Name
 		gcpInstance.Annotations[downstreamclient.UpstreamOwnerNamespace] = instance.Namespace
 		gcpInstance.Annotations[downstreamclient.UpstreamOwnerClusterName] = clusterName
@@ -938,8 +1005,12 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 		instanceMetadata["user-data"] = ptr.To(fmt.Sprintf("## template: jinja\n#cloud-config\n\n%s", string(userData)))
 
 		gcpInstance.Spec.ResourceSpec = crossplanecommonv1.ResourceSpec{
+			ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+				crossplanecommonv1.ManagementActionAll,
+			},
+			DeletionPolicy: crossplanecommonv1.DeletionDelete,
 			ProviderConfigReference: &crossplanecommonv1.Reference{
-				Name: "project-test-fz3pr6", // TODO
+				Name: providerConfig.Name,
 			},
 		}
 
@@ -978,6 +1049,10 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	}
 
 	logger.Info("downstream instance processed", "operation_result", result)
+
+	if err := r.syncInstancePowerState(ctx, upstreamClient, instance, gcpInstance); err != nil {
+		return ctrl.Result{}, nil, fmt.Errorf("failed to sync instance power state: %w", err)
+	}
 
 	return ctrl.Result{}, gcpInstance, nil
 }
@@ -1175,41 +1250,130 @@ func (r *InstanceReconciler) buildGCPInstanceNetworkInterfaces(
 	return nil
 }
 
+func (r *InstanceReconciler) syncInstancePowerState(
+	ctx context.Context,
+	upstreamClient client.Client,
+	instance *computev1alpha.Instance,
+	gcpInstance *gcpcomputev1beta2.Instance,
+) error {
+	runningCondition := metav1.Condition{
+		Type:               computev1alpha.InstanceRunning,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: instance.Generation,
+		Reason:             computev1alpha.InstanceRunningReasonStopped,
+		Message:            "Instance is not running",
+	}
+
+	// In testing, no observation has been made of Crossplane updating these
+	// values as instances are created or deleted, but we go through the logic
+	// either way. In our case, we'll say the instance is stopping if there's
+	// a deletion timestamp. The provisioning path does get handled correctly in
+	// that CurrentStatus is nil until it's RUNNING.
+
+	if !instance.DeletionTimestamp.IsZero() {
+		runningCondition.Reason = computev1alpha.InstanceRunningReasonStopping
+		runningCondition.Message = "Instance is being deleted"
+	} else {
+
+		// CurrentStatus can be one of:
+		//
+		//  - PROVISIONING
+		//  - STAGING
+		//  - RUNNING
+		//  - STOPPING
+		//  - SUSPENDING
+		//  - SUSPENDED
+		//  - REPAIRING
+		//  - TERMINATED
+		//
+		// See: https://cloud.google.com/compute/docs/instances/instance-lifecycle
+		switch ptr.Deref(gcpInstance.Status.AtProvider.CurrentStatus, "PROVISIONING") {
+		case "PROVISIONING":
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonStarting
+			runningCondition.Message = "Instance is starting"
+		case "STAGING":
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonStarting
+			runningCondition.Message = "Instance is staging"
+		case "RUNNING":
+			runningCondition.Status = metav1.ConditionTrue
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonRunning
+			runningCondition.Message = "Instance is running"
+		case "STOPPING":
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonStopping
+			runningCondition.Message = "Instance is stopping"
+		case "SUSPENDING":
+		case "SUSPENDED":
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonStopped
+			runningCondition.Message = "Instance is suspended or suspending at provider"
+		case "REPAIRING":
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonStopped
+			runningCondition.Message = "Instance is being repaired at provider"
+		case "TERMINATED":
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonStopped
+			runningCondition.Message = "Instance is not running"
+		}
+	}
+
+	if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
+		if err := upstreamClient.Status().Update(ctx, instance); err != nil {
+			return fmt.Errorf("failed to update instance status: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func (r *InstanceReconciler) Finalize(
 	ctx context.Context,
-	obj client.Object,
-) (finalizer.Result, error) {
+	upstreamClient client.Client,
+	instance *computev1alpha.Instance,
+) error {
 	logger := log.FromContext(ctx)
-	instance := obj.(*computev1alpha.Instance)
 
-	gcpInstance := &gcpcomputev1beta2.Instance{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("instance-%s", instance.UID),
-		},
+	var gcpInstance gcpcomputev1beta2.Instance
+	gcpInstanceObjectKey := client.ObjectKey{
+		Name: fmt.Sprintf("instance-%s", instance.UID),
 	}
 
-	if err := r.DownstreamCluster.GetClient().Delete(ctx, gcpInstance); client.IgnoreNotFound(err) != nil {
-		return finalizer.Result{}, fmt.Errorf("failed to delete downstream instance: %w", err)
+	if err := r.DownstreamCluster.GetClient().Get(ctx, gcpInstanceObjectKey, &gcpInstance); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("failed fetching downstream instance: %w", err)
 	}
 
-	// TODO(jreese) wait for the instance to be deleted, need to move away from
-	// the finalizer interface from controller-runtime to wait without passing
-	// errors around.
+	if dt := gcpInstance.DeletionTimestamp; !gcpInstance.CreationTimestamp.IsZero() && dt.IsZero() {
+		if err := r.DownstreamCluster.GetClient().Delete(ctx, &gcpInstance); err != nil {
+			return fmt.Errorf("failed to delete downstream instance: %w", err)
+		}
+	}
 
-	// Finalize secrets, service accounts, at a workload level.
+	// Wait for the instance to be deleted - crossplane doesn't update the
+	// atProvider information or any status conditions when it's successfully
+	// deleted a resource. Observing that the crossplane finalizer has been
+	// removed is the best we've got.
+	if !gcpInstance.CreationTimestamp.IsZero() && controllerutil.ContainsFinalizer(&gcpInstance, crossplaneFinalizer) {
+		logger.Info("downstream instance is being deleted")
+		return r.syncInstancePowerState(ctx, upstreamClient, instance, &gcpInstance)
+	}
 
 	logger.Info("downstream instance deleted")
 
-	return finalizer.Result{}, nil
+	if controllerutil.RemoveFinalizer(&gcpInstance, gcpInfraFinalizer) {
+		if err := r.DownstreamCluster.GetClient().Update(ctx, &gcpInstance); err != nil {
+			return fmt.Errorf("failed to remove finalizer: %w", err)
+		}
+	}
+
+	if controllerutil.RemoveFinalizer(instance, gcpInfraFinalizer) {
+		if err := upstreamClient.Update(ctx, instance); err != nil {
+			return fmt.Errorf("failed to remove finalizer: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
-	r.finalizers = finalizer.NewFinalizers()
-	if err := r.finalizers.Register(gcpInfraFinalizer, r); err != nil {
-		return fmt.Errorf("failed to register finalizer: %w", err)
-	}
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&computev1alpha.Instance{}).

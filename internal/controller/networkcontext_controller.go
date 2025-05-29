@@ -39,12 +39,11 @@ type NetworkContextReconciler struct {
 	LocationClassName string
 }
 
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=networkcontexts,verbs=get;list;watch
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=networkcontexts/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=networkcontexts/finalizers,verbs=update
+// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networkcontexts,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networkcontexts/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networkcontexts/finalizers,verbs=update
 
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computenetworks,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=compute.cnrm.cloud.google.com,resources=computenetworks/status,verbs=get
+// TODO(jreese) RBAC for Crossplane resources
 
 func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (_ ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
@@ -73,6 +72,8 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 
 	logger.Info("reconciling network context")
 	defer logger.Info("reconcile complete")
+
+	// TODO(jreese) finalizer logic
 
 	if !networkContext.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil

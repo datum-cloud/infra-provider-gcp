@@ -22,6 +22,7 @@ import (
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
 	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
+	gcpv1beta1 "github.com/upbound/provider-gcp/apis/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -64,6 +65,7 @@ func init() {
 	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
 	utilruntime.Must(kccsecretmanagerv1beta1.AddToScheme(scheme))
 
+	utilruntime.Must(gcpv1beta1.SchemeBuilder.AddToScheme(scheme))
 	utilruntime.Must(gcpcomputev1beta1.AddToScheme(scheme))
 	utilruntime.Must(gcpcomputev1beta2.AddToScheme(scheme))
 	utilruntime.Must(gcpcloudplatformv1beta1.AddToScheme(scheme))
@@ -191,6 +193,14 @@ func main() {
 	})
 	if err != nil {
 		setupLog.Error(err, "failed to construct cluster")
+		os.Exit(1)
+	}
+
+	if err = (&controller.WorkloadReconciler{
+		LocationClassName: locationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
 		os.Exit(1)
 	}
 

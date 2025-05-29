@@ -106,16 +106,16 @@ func (e *enqueueRequestForOwner[object]) parseOwnerTypeGroupKind(scheme *runtime
 // getOwnerReconcileRequest looks at object and builds a map of reconcile.Request to reconcile
 // owners of object that match e.OwnerType.
 func (e *enqueueRequestForOwner[object]) getOwnerReconcileRequest(obj metav1.Object, result map[mcreconcile.Request]empty) {
-	labels := obj.GetLabels()
-	if labels[UpstreamOwnerKind] == e.groupKind.Kind && labels[UpstreamOwnerGroup] == e.groupKind.Group {
+	annotations := obj.GetAnnotations()
+	if annotations[UpstreamOwnerKind] == e.groupKind.Kind && annotations[UpstreamOwnerGroup] == e.groupKind.Group {
 		request := mcreconcile.Request{
 			Request: reconcile.Request{
 				NamespacedName: types.NamespacedName{
-					Name:      labels[UpstreamOwnerName],
-					Namespace: labels[UpstreamOwnerNamespace],
+					Name:      annotations[UpstreamOwnerName],
+					Namespace: annotations[UpstreamOwnerNamespace],
 				},
 			},
-			ClusterName: strings.TrimPrefix(strings.ReplaceAll(labels[UpstreamOwnerClusterName], "_", "/"), "cluster-"),
+			ClusterName: strings.TrimPrefix(strings.ReplaceAll(annotations[UpstreamOwnerClusterName], "_", "/"), "cluster-"),
 		}
 		result[request] = empty{}
 	}

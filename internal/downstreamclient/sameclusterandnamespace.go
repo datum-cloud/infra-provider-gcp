@@ -48,6 +48,10 @@ func (c *sameClusterAndNamespaceResourceStrategy) ObjectMetaFromUpstreamObject(c
 	}, nil
 }
 
+func (c *sameClusterAndNamespaceResourceStrategy) GetDownstreamNamespaceName(ctx context.Context, obj metav1.Object) (string, error) {
+	return obj.GetNamespace(), nil
+}
+
 func (c *sameClusterAndNamespaceResourceStrategy) SetControllerReference(ctx context.Context, owner, controlled metav1.Object, opts ...controllerutil.OwnerReferenceOption) error {
 	return controllerutil.SetControllerReference(owner, controlled, c.GetClient().Scheme(), opts...)
 }

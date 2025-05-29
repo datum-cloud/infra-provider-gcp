@@ -57,7 +57,6 @@ var machineTypeMap = map[string]string{
 	"datumcloud/d1-standard-2": "n2-standard-2",
 }
 
-const gcpInfraFinalizer = "compute.datumapis.com/infra-provider-gcp-deployment-controller"
 const deploymentUIDLabel = "compute.datumapis.com/deployment-uid"
 
 //go:embed cloudinit/populate_secrets.py

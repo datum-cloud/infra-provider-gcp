@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -68,7 +67,6 @@ func EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr mcmanager.Manager) m
 				return nil
 			}
 
-			// Reconcile instances which are not in a programmed state
 			var instanceList computev1alpha.InstanceList
 			listOpts := []client.ListOption{
 				client.InNamespace(upstreamNamespace),
@@ -90,17 +88,15 @@ func EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr mcmanager.Manager) m
 
 			var requests []mcreconcile.Request
 			for _, instance := range instanceList.Items {
-				if !apimeta.IsStatusConditionTrue(instance.Status.Conditions, computev1alpha.InstanceProgrammed) {
-					requests = append(requests, mcreconcile.Request{
-						Request: reconcile.Request{
-							NamespacedName: types.NamespacedName{
-								Namespace: instance.Namespace,
-								Name:      instance.Name,
-							},
+				requests = append(requests, mcreconcile.Request{
+					Request: reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: instance.Namespace,
+							Name:      instance.Name,
 						},
-						ClusterName: upstreamClusterName,
-					})
-				}
+					},
+					ClusterName: upstreamClusterName,
+				})
 			}
 
 			return requests

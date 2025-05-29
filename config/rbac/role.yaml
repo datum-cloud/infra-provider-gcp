@@ -16,25 +16,12 @@ rules:
   - compute.cnrm.cloud.google.com
   resources:
   - computeinstancegroupmanager/status
-  - computenetworks/status
   verbs:
   - get
-- apiGroups:
-  - compute.cnrm.cloud.google.com
-  resources:
-  - computenetworks
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
 - apiGroups:
   - compute.datumapis.com
   resources:
-  - networkcontexts
+  - instances
   verbs:
   - get
   - list
@@ -42,14 +29,14 @@ rules:
 - apiGroups:
   - compute.datumapis.com
   resources:
-  - networkcontexts/finalizers
+  - instances/finalizers
   - workloaddeployments/finalizers
   verbs:
   - update
 - apiGroups:
   - compute.datumapis.com
   resources:
-  - networkcontexts/status
+  - instances/status
   - workloaddeployments/status
   verbs:
   - get
@@ -75,3 +62,39 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - networking.datumapis.com
+  resources:
+  - networkcontexts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.datumapis.com
+  resources:
+  - networkcontexts/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - networking.datumapis.com
+  resources:
+  - networkcontexts/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - workload.datumapis.com
+  resources:
+  - workloads
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - workload.datumapis.com
+  resources:
+  - workloads/finalizers
+  verbs:
+  - update

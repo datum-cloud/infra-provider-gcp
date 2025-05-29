@@ -46,7 +46,7 @@ func (c *mappedNamespaceResourceStrategy) GetClient() client.Client {
 }
 
 func (c *mappedNamespaceResourceStrategy) ObjectMetaFromUpstreamObject(ctx context.Context, obj metav1.Object) (metav1.ObjectMeta, error) {
-	downstreamNamespaceName, err := c.getDownstreamNamespaceName(ctx, obj)
+	downstreamNamespaceName, err := c.GetDownstreamNamespaceName(ctx, obj)
 	if err != nil {
 		return metav1.ObjectMeta{}, fmt.Errorf("failed to get downstream namespace name: %w", err)
 	}
@@ -73,7 +73,7 @@ func (c *mappedNamespaceResourceStrategy) getUpstreamNamespace(ctx context.Conte
 	return namespace, nil
 }
 
-func (c *mappedNamespaceResourceStrategy) getDownstreamNamespaceName(ctx context.Context, obj metav1.Object) (string, error) {
+func (c *mappedNamespaceResourceStrategy) GetDownstreamNamespaceName(ctx context.Context, obj metav1.Object) (string, error) {
 	namespace, err := c.getUpstreamNamespace(ctx, obj)
 	if err != nil {
 		return "", fmt.Errorf("failed to get downstream namespace: %w", err)
@@ -130,7 +130,7 @@ func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Con
 
 	anchorName := fmt.Sprintf("anchor-%s", owner.GetUID())
 
-	anchorLabels := map[string]string{
+	anchorAnnotations := map[string]string{
 		UpstreamOwnerClusterName: fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_")),
 		UpstreamOwnerGroup:       gvk.Group,
 		UpstreamOwnerKind:        gvk.Kind,
@@ -147,7 +147,7 @@ func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Con
 
 	if anchorConfigMap.CreationTimestamp.IsZero() {
 		anchorConfigMap.Name = anchorName
-		anchorConfigMap.Labels = anchorLabels
+		anchorConfigMap.Annotations = anchorAnnotations
 		anchorConfigMap.Namespace = controlled.GetNamespace()
 		if err := downstreamClient.Create(ctx, &anchorConfigMap); err != nil {
 			return fmt.Errorf("failed creating anchor configmap: %w", err)
@@ -158,17 +158,17 @@ func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Con
 		return fmt.Errorf("failed setting anchor owner reference: %w", err)
 	}
 
-	labels := controlled.GetLabels()
-	if labels == nil {
-		labels = map[string]string{}
+	annotations := controlled.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
 	}
 
-	labels[UpstreamOwnerClusterName] = anchorLabels[UpstreamOwnerClusterName]
-	labels[UpstreamOwnerGroup] = anchorLabels[UpstreamOwnerGroup]
-	labels[UpstreamOwnerKind] = anchorLabels[UpstreamOwnerKind]
-	labels[UpstreamOwnerName] = anchorLabels[UpstreamOwnerName]
-	labels[UpstreamOwnerNamespace] = anchorLabels[UpstreamOwnerNamespace]
-	controlled.SetLabels(labels)
+	annotations[UpstreamOwnerClusterName] = anchorAnnotations[UpstreamOwnerClusterName]
+	annotations[UpstreamOwnerGroup] = anchorAnnotations[UpstreamOwnerGroup]
+	annotations[UpstreamOwnerKind] = anchorAnnotations[UpstreamOwnerKind]
+	annotations[UpstreamOwnerName] = anchorAnnotations[UpstreamOwnerName]
+	annotations[UpstreamOwnerNamespace] = anchorAnnotations[UpstreamOwnerNamespace]
+	controlled.SetAnnotations(annotations)
 
 	return nil
 }

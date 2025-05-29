@@ -30,6 +30,10 @@ type ResourceStrategy interface {
 	// Name fields populated for the downstream resource.
 	ObjectMetaFromUpstreamObject(context.Context, metav1.Object) (metav1.ObjectMeta, error)
 
+	// GetDownstreamNamespaceName returns the namespace name for the downstream
+	// resource based on the provided upstream object.
+	GetDownstreamNamespaceName(context.Context, metav1.Object) (string, error)
+
 	SetControllerReference(context.Context, metav1.Object, metav1.Object, ...controllerutil.OwnerReferenceOption) error
 	SetOwnerReference(context.Context, metav1.Object, metav1.Object, ...controllerutil.OwnerReferenceOption) error
 	DeleteAnchorForObject(ctx context.Context, owner client.Object) error
