@@ -1446,6 +1446,12 @@ func (r *InstanceReconciler) syncInstancePowerState(
 	// either way. In our case, we'll say the instance is stopping if there's
 	// a deletion timestamp. The provisioning path does get handled correctly in
 	// that CurrentStatus is nil until it's RUNNING.
+	//
+	// TODO(jreese) we may be able to have an Observe mode resource that we can
+	// force refreshes on when the main resource is being processed. This seems
+	// to work in testing, but it seems that at least one modification is needed
+	// to get the first refresh to happen.
+	// https://docs.crossplane.io/latest/guides/import-existing-resources/#import-resources-automatically
 
 	if !instance.DeletionTimestamp.IsZero() {
 		runningCondition.Reason = computev1alpha.InstanceRunningReasonStopping
