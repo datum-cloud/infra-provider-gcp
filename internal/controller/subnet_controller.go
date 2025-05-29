@@ -158,7 +158,7 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 					Name: fmt.Sprintf("network-%s", network.UID),
 				},
 				Region:    ptr.To(location.Spec.Provider.GCP.Region),
-				Purpose:   ptr.To("PRIVATE_RFC_1918"),
+				Purpose:   ptr.To("PRIVATE"),
 				StackType: ptr.To("IPV4_ONLY"),
 			},
 		}
