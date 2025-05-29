@@ -185,7 +185,7 @@ func (r *WorkloadReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}).
+		}, mcbuilder.WithEngageWithLocalCluster(false)).
 		Named("workload").
 		Complete(r)
 }

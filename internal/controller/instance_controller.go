@@ -1560,10 +1560,10 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
 
 	return mcbuilder.ControllerManagedBy(mgr).
-		For(&computev1alpha.Instance{}).
-		Watches(&gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr)).
-		Watches(&gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr)).
-		Watches(&gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr)).
+		For(&computev1alpha.Instance{}, mcbuilder.WithEngageWithLocalCluster(false)).
+		Watches(&gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr), mcbuilder.WithEngageWithLocalCluster(false)).
+		Watches(&gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr), mcbuilder.WithEngageWithLocalCluster(false)).
+		Watches(&gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr), mcbuilder.WithEngageWithLocalCluster(false)).
 		Watches(&gcpcomputev1beta2.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
@@ -1590,7 +1590,7 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}).
+		}, mcbuilder.WithEngageWithLocalCluster(false)).
 		Named("instance").
 		Complete(r)
 }

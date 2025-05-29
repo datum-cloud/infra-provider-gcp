@@ -213,12 +213,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.SubnetReconciler{
-		Config:            serverConfig,
+	if err = (&controller.NetworkReconciler{
 		LocationClassName: locationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "SubnetReconciler")
+		setupLog.Error(err, "unable to create controller", "controller", "NetworkReconciler")
 		os.Exit(1)
 	}
 
@@ -228,6 +227,15 @@ func main() {
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
+		os.Exit(1)
+	}
+
+	if err = (&controller.SubnetReconciler{
+		Config:            serverConfig,
+		LocationClassName: locationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SubnetReconciler")
 		os.Exit(1)
 	}
 

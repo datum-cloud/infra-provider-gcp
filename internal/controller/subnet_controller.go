@@ -219,7 +219,7 @@ func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	}
 
 	return mcbuilder.ControllerManagedBy(mgr).
-		For(&networkingv1alpha.Subnet{}).
+		For(&networkingv1alpha.Subnet{}, mcbuilder.WithEngageWithLocalCluster(false)).
 		Watches(&gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
@@ -246,7 +246,7 @@ func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}).
+		}, mcbuilder.WithEngageWithLocalCluster(false)).
 		Named("subnet").
 		Complete(r)
 }

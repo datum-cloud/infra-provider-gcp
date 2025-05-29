@@ -38,6 +38,7 @@ rules:
   - networking.datumapis.com
   resources:
   - networkcontexts
+  - networks
   verbs:
   - get
   - list
@@ -46,6 +47,7 @@ rules:
   - networking.datumapis.com
   resources:
   - networkcontexts/finalizers
+  - networks/finalizers
   verbs:
   - update
 - apiGroups:

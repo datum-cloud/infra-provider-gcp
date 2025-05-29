@@ -75,8 +75,6 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 	logger.Info("reconciling network context")
 	defer logger.Info("reconcile complete")
 
-	// TODO(jreese) finalizer logic
-
 	if !networkContext.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}

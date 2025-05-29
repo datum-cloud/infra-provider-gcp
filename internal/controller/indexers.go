@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/utils/ptr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
@@ -31,17 +31,12 @@ func addNetworkContextControllerIndexers(ctx context.Context, mgr mcmanager.Mana
 }
 
 func networkContextControllerNetworkUIDIndexFunc(o client.Object) []string {
-	networkContext := o.(*networkingv1alpha.NetworkContext)
 
-	ownerRefs := networkContext.GetOwnerReferences()
-
-	for _, ref := range ownerRefs {
-		if ref.Kind == "Network" && ptr.Deref(ref.Controller, false) {
-			return []string{
-				fmt.Sprintf("network-%s", ref.UID),
-			}
+	if networkRef := metav1.GetControllerOf(o); networkRef != nil {
+		return []string{
+			fmt.Sprintf("network-%s", networkRef.UID),
 		}
 	}
 
-	return []string{}
+	return nil
 }
