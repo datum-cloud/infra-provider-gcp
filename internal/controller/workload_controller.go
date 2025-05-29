@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
+	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -80,6 +81,24 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 				},
 			}); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to delete secret: %w", err)
+			}
+
+			// Locate firewall rules and delete them
+			var firewallRules gcpcomputev1beta2.FirewallList
+			listOpts := []client.ListOption{
+				client.MatchingLabels{
+					computev1alpha.WorkloadUIDLabel: string(workload.UID),
+				},
+			}
+
+			if err := cl.GetClient().List(ctx, &firewallRules, listOpts...); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to list firewall rules: %w", err)
+			}
+
+			for _, firewallRule := range firewallRules.Items {
+				if err := downstreamStrategy.GetClient().Delete(ctx, &firewallRule); client.IgnoreNotFound(err) != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to delete firewall rule: %w", err)
+				}
 			}
 
 			controllerutil.RemoveFinalizer(&workload, gcpInfraFinalizer)

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"path"
+	"strconv"
+	"strings"
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	crossplanemeta "github.com/crossplane/crossplane-runtime/pkg/meta"
@@ -213,10 +215,9 @@ func (r *InstanceReconciler) reconcileInstance(
 		}
 	}()
 
-	// TODO
-	// if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, upstreamClient, gcpProject, r.InfraClusterNamespaceName, deployment); err != nil {
-	// 	return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
-	// }
+	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, providerConfig, upstreamClient, workload, workloadDeployment); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
+	}
 
 	// Service account names cannot exceed 30 characters
 	// TODO(jreese) move to base36, as the underlying bytes won't be lost
@@ -827,11 +828,6 @@ func (r *InstanceReconciler) reconcileSecrets(
 		return false, nil
 	}
 
-	var secretIAMPolicy gcpsecretmanagerv1beta2.SecretIAMMember
-	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKeyFromObject(&secret), &secretIAMPolicy); client.IgnoreNotFound(err) != nil {
-		return false, fmt.Errorf("failed fetching secret's IAM policy: %w", err)
-	}
-
 	// Store secret information in the secret version
 	// TODO(jreese) handle updates to secrets - this needs to be done by creating
 	// a new secret version.
@@ -896,13 +892,6 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 	logger.Info("downstream secret version processed", "operation_result", result)
 
-	if secretVersion.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("secret version not ready yet", "secret", secret.Name, "secret_version", secretVersion.Name)
-		programmedCondition.Reason = "ProvisioningSecretVersion"
-		programmedCondition.Message = "Secret version is being provisioned for the workload"
-		return false, nil
-	}
-
 	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
 		Encoding:    "b64",
 		Content:     base64.StdEncoding.EncodeToString([]byte(populateSecretsScript)),
@@ -916,8 +905,13 @@ func (r *InstanceReconciler) reconcileSecrets(
 		fmt.Sprintf("/etc/secrets/populate_secrets.py https://secretmanager.googleapis.com/v1/%s/versions/latest:access", *secret.Status.AtProvider.Name),
 	)
 
-	if secretIAMPolicy.CreationTimestamp.IsZero() {
-		secretIAMPolicy = gcpsecretmanagerv1beta2.SecretIAMMember{
+	var secretIAMMember gcpsecretmanagerv1beta2.SecretIAMMember
+	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKeyFromObject(&secret), &secretIAMMember); client.IgnoreNotFound(err) != nil {
+		return false, fmt.Errorf("failed fetching secret's IAM policy: %w", err)
+	}
+
+	if secretIAMMember.CreationTimestamp.IsZero() {
+		secretIAMMember = gcpsecretmanagerv1beta2.SecretIAMMember{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: secret.Namespace,
 				Name:      secret.Name,
@@ -933,18 +927,37 @@ func (r *InstanceReconciler) reconcileSecrets(
 					},
 				},
 				ForProvider: gcpsecretmanagerv1beta2.SecretIAMMemberParameters{
+					SecretIDRef: &crossplanecommonv1.Reference{
+						Name: secret.Name,
+					},
 					Role:   ptr.To("roles/secretmanager.secretAccessor"),
-					Member: ptr.To(fmt.Sprintf("%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], providerConfig.Spec.ProjectID)),
+					Member: ptr.To(fmt.Sprintf("serviceAccount:%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], providerConfig.Spec.ProjectID)),
 				},
 			},
 		}
 
-		if err := controllerutil.SetOwnerReference(&secret, &secretIAMPolicy, r.DownstreamCluster.GetClient().Scheme()); err != nil {
+		if err := controllerutil.SetOwnerReference(&secret, &secretIAMMember, r.DownstreamCluster.GetClient().Scheme()); err != nil {
 			return false, fmt.Errorf("failed to set owner reference on secret IAM policy: %w", err)
 		}
 
-		if err := r.DownstreamCluster.GetClient().Create(ctx, &secretIAMPolicy); err != nil {
+		if err := r.DownstreamCluster.GetClient().Create(ctx, &secretIAMMember); err != nil {
 			return false, fmt.Errorf("failed setting IAM policy on secret: %w", err)
+		}
+
+		// Wait for these together so they can be processed in parallel.
+
+		if secretVersion.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+			logger.Info("secret version not ready yet", "secret", secret.Name, "secret_version", secretVersion.Name)
+			programmedCondition.Reason = "ProvisioningSecretVersion"
+			programmedCondition.Message = "Secret version is being provisioned for the workload"
+			return false, nil
+		}
+
+		if secretIAMMember.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+			logger.Info("secret IAM member not ready yet", "secret", secret.Name, "secret_version", secretVersion.Name)
+			programmedCondition.Reason = "ProvisioningSecretIAMMember"
+			programmedCondition.Message = "Secret IAM member is being provisioned"
+			return false, nil
 		}
 	}
 
@@ -1025,7 +1038,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 				Scopes: []*string{
 					ptr.To("cloud-platform"),
 				},
-				Email: serviceAccount.Status.AtProvider.Email,
+				Email: ptr.To(fmt.Sprintf("%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], providerConfig.Spec.ProjectID)),
 			}
 		}
 		gcpInstance.Spec.ForProvider.Tags = []*string{
@@ -1250,6 +1263,152 @@ func (r *InstanceReconciler) buildGCPInstanceNetworkInterfaces(
 	return nil
 }
 
+func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
+	ctx context.Context,
+	providerConfig gcpv1beta1.ProviderConfig,
+	upstreamClient client.Client,
+	workload *computev1alpha.Workload,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+) error {
+	logger := log.FromContext(ctx)
+	for interfaceIndex, networkInterface := range workloadDeployment.Spec.Template.Spec.NetworkInterfaces {
+		interfacePolicy := networkInterface.NetworkPolicy
+		if interfacePolicy == nil {
+			continue
+		}
+
+		var networkBinding networkingv1alpha.NetworkBinding
+		networkBindingObjectKey := client.ObjectKey{
+			Namespace: workloadDeployment.Namespace,
+			Name:      fmt.Sprintf("%s-net-%d", workloadDeployment.Name, interfaceIndex),
+		}
+
+		if err := upstreamClient.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
+			return fmt.Errorf("failed fetching network binding for interface: %w", err)
+		}
+
+		if networkBinding.Status.NetworkContextRef == nil {
+			return fmt.Errorf("network binding not associated with network context")
+		}
+
+		var networkContext networkingv1alpha.NetworkContext
+		networkContextObjectKey := client.ObjectKey{
+			Namespace: networkBinding.Status.NetworkContextRef.Namespace,
+			Name:      networkBinding.Status.NetworkContextRef.Name,
+		}
+		if err := upstreamClient.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
+			return fmt.Errorf("failed fetching network context: %w", err)
+		}
+
+		var network networkingv1alpha.Network
+		if err := upstreamClient.Get(ctx, client.ObjectKey{Namespace: networkContext.Namespace, Name: networkContext.Spec.Network.Name}, &network); err != nil {
+			return fmt.Errorf("failed to get network: %w", err)
+		}
+
+		for ruleIndex, ingressRule := range interfacePolicy.Ingress {
+			// This could result in duplicate firewall rules if a workload that spans
+			// multiple contexts of the same network is created. This is considered
+			// ok for the time being, as the move to effective network policies for
+			// interfaces will address this.
+			//
+			// In addition, these will not be GCd until the workload is deleted,
+			firewallName := fmt.Sprintf("deployment-%s-net-%d-%d", workloadDeployment.UID, interfaceIndex, ruleIndex)
+
+			var firewall gcpcomputev1beta2.Firewall
+			firewallObjectKey := client.ObjectKey{
+				Name: firewallName,
+			}
+
+			if err := r.DownstreamCluster.GetClient().Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf("failed to read firewall from k8s API: %w", err)
+			}
+
+			if firewall.CreationTimestamp.IsZero() {
+				logger.Info("creating firewall for interface policy rule", "firewall_name", firewallName)
+				firewall = gcpcomputev1beta2.Firewall{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: firewallObjectKey.Name,
+						Labels: map[string]string{
+							computev1alpha.WorkloadUIDLabel:           string(workload.UID),
+							computev1alpha.WorkloadDeploymentUIDLabel: string(workloadDeployment.UID),
+						},
+					},
+					Spec: gcpcomputev1beta2.FirewallSpec{
+						ResourceSpec: crossplanecommonv1.ResourceSpec{
+							ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+								crossplanecommonv1.ManagementActionAll,
+							},
+							DeletionPolicy: crossplanecommonv1.DeletionDelete,
+							ProviderConfigReference: &crossplanecommonv1.Reference{
+								Name: providerConfig.Name,
+							},
+						},
+						ForProvider: gcpcomputev1beta2.FirewallParameters{
+							Description: ptr.To(fmt.Sprintf(
+								"instance interface policy for %s: interfaceIndex:%d, ruleIndex:%d",
+								workloadDeployment.Name,
+								interfaceIndex,
+								ruleIndex,
+							)),
+							Direction: ptr.To("INGRESS"),
+							NetworkRef: &crossplanecommonv1.Reference{
+								Name: fmt.Sprintf("network-%s", network.UID),
+							},
+							Priority: ptr.To(float64(65534)),
+							TargetTags: []*string{
+								ptr.To(fmt.Sprintf("workload-%s", workload.UID)),
+								ptr.To(fmt.Sprintf("deployment-%s", workloadDeployment.UID)),
+							},
+						},
+					},
+				}
+
+				for _, port := range ingressRule.Ports {
+					ipProtocol := "tcp"
+					if port.Protocol != nil {
+						ipProtocol = strings.ToLower(string(*port.Protocol))
+					}
+
+					var gcpPorts []*string
+					if port.Port != nil {
+						var gcpPort string
+
+						gcpPort = strconv.Itoa(port.Port.IntValue())
+						if gcpPort == "0" {
+							// TODO(jreese) look up named port
+							logger.Info("named port lookup not implemented")
+							return nil
+						}
+
+						if port.EndPort != nil {
+							gcpPort = fmt.Sprintf("%s-%d", gcpPort, *port.EndPort)
+						}
+
+						gcpPorts = append(gcpPorts, ptr.To(gcpPort))
+					}
+
+					firewall.Spec.ForProvider.Allow = append(firewall.Spec.ForProvider.Allow, gcpcomputev1beta2.AllowParameters{
+						Protocol: ptr.To(ipProtocol),
+						Ports:    gcpPorts,
+					})
+				}
+
+				for _, peer := range ingressRule.From {
+					if peer.IPBlock != nil {
+						firewall.Spec.ForProvider.SourceRanges = append(firewall.Spec.ForProvider.SourceRanges, ptr.To(peer.IPBlock.CIDR))
+						// TODO(jreese) implement IPBlock.Except as a separate rule of one higher priority
+					}
+				}
+
+				if err := r.DownstreamCluster.GetClient().Create(ctx, &firewall); err != nil {
+					return fmt.Errorf("failed to create firewall: %w", err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (r *InstanceReconciler) syncInstancePowerState(
 	ctx context.Context,
 	upstreamClient client.Client,
@@ -1329,6 +1488,7 @@ func (r *InstanceReconciler) Finalize(
 	instance *computev1alpha.Instance,
 ) error {
 	logger := log.FromContext(ctx)
+	logger.Info("finalizing instance", "instance_name", instance.Name, "finalizers", instance.Finalizers)
 
 	var gcpInstance gcpcomputev1beta2.Instance
 	gcpInstanceObjectKey := client.ObjectKey{
