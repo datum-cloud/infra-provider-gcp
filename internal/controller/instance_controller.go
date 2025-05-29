@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -48,10 +49,21 @@ import (
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
-const gcpWorkloadFinalizer = "compute.datumapis.com/gcp-workload-controller"
 const crossplaneFinalizer = "finalizer.managedresource.crossplane.io"
 
 var errResourceIsDeleting = errors.New("resource is deleting")
+
+var imageMap = map[string]string{
+	"datumcloud/ubuntu-2204-lts":           "projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20240927",
+	"datumcloud/cos-stable-117-18613-0-79": "projects/cos-cloud/global/images/cos-stable-117-18613-0-79",
+}
+
+var machineTypeMap = map[string]string{
+	"datumcloud/d1-standard-2": "n2-standard-2",
+}
+
+//go:embed cloudinit/populate_secrets.py
+var populateSecretsScript string
 
 // InstanceReconciler reconciles Instances and manages their intended state in
 // GCP
@@ -325,7 +337,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		return ctrl.Result{}, nil
 	}
 
-	result, gcpInstance, err := r.reconcileGCPInstance(
+	gcpInstance, err := r.reconcileGCPInstance(
 		ctx,
 		clusterName,
 		providerConfig,
@@ -338,8 +350,8 @@ func (r *InstanceReconciler) reconcileInstance(
 		instanceMetadata,
 		serviceAccount,
 	)
-	if !result.IsZero() || err != nil {
-		return result, err
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
@@ -864,7 +876,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 					crossplanecommonv1.ManagementActionAll,
 				},
 				DeletionPolicy:          crossplanecommonv1.DeletionDelete,
-				ProviderConfigReference: secret.Spec.ResourceSpec.ProviderConfigReference,
+				ProviderConfigReference: secret.Spec.ProviderConfigReference,
 			},
 			ForProvider: gcpsecretmanagerv1beta1.SecretVersionParameters{
 				Enabled:        ptr.To(true),
@@ -978,7 +990,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	cloudConfig *cloudinit.CloudConfig,
 	instanceMetadata map[string]*string,
 	serviceAccount gcpcloudplatformv1beta1.ServiceAccount,
-) (ctrl.Result, *gcpcomputev1beta2.Instance, error) {
+) (*gcpcomputev1beta2.Instance, error) {
 	logger := log.FromContext(ctx)
 
 	runtimeSpec := instance.Spec.Runtime
@@ -1060,16 +1072,16 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	})
 
 	if err != nil {
-		return ctrl.Result{}, nil, fmt.Errorf("failed to create gcp instance: %w", err)
+		return nil, fmt.Errorf("failed to create gcp instance: %w", err)
 	}
 
 	logger.Info("downstream instance processed", "operation_result", result)
 
 	if err := r.syncInstancePowerState(ctx, upstreamClient, instance, gcpInstance); err != nil {
-		return ctrl.Result{}, nil, fmt.Errorf("failed to sync instance power state: %w", err)
+		return nil, fmt.Errorf("failed to sync instance power state: %w", err)
 	}
 
-	return ctrl.Result{}, gcpInstance, nil
+	return gcpInstance, nil
 }
 
 func (r *InstanceReconciler) buildGCPInstanceVolumes(
@@ -1078,6 +1090,10 @@ func (r *InstanceReconciler) buildGCPInstanceVolumes(
 	instance *computev1alpha.Instance,
 	gcpInstance *gcpcomputev1beta2.Instance,
 ) error {
+	// Temporary to address linter violations for unused variables. Will be
+	// removed once we implement additional volume support below.
+	_ = ctx
+	_ = cloudConfig
 	for volumeIndex, volume := range instance.Spec.Volumes {
 		if volume.Disk == nil {
 			continue

@@ -5,20 +5,6 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - compute.cnrm.cloud.google.com
-  resources:
-  - computeinstancegroupmanager
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - compute.cnrm.cloud.google.com
-  resources:
-  - computeinstancegroupmanager/status
-  verbs:
-  - get
-- apiGroups:
   - compute.datumapis.com
   resources:
   - instances
@@ -30,30 +16,16 @@ rules:
   - compute.datumapis.com
   resources:
   - instances/finalizers
-  - workloaddeployments/finalizers
   verbs:
   - update
 - apiGroups:
   - compute.datumapis.com
   resources:
   - instances/status
-  - workloaddeployments/status
   verbs:
   - get
   - patch
   - update
-- apiGroups:
-  - compute.datumapis.com
-  resources:
-  - workloaddeployments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
 - apiGroups:
   - ""
   resources:

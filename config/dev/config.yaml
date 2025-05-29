@@ -11,3 +11,7 @@ webhookServer:
 
 downstreamResourceManagement:
   kubeconfigPath: ../network-services-operator/kind.kubeconfig
+  providerConfigStrategy:
+    mode: single
+    single:
+      name: project-test-fz3pr6

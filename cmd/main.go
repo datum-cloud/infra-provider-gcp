@@ -204,22 +204,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// if err = (&controller.WorkloadDeploymentReconciler{
-	// 	InfraClient:               mgr.GetLocalManager().GetClient(),
-	// 	LocationClassName:         locationClassName,
-	// 	InfraClusterNamespaceName: "TODO",
-	// }).SetupWithManager(mgr); err != nil {
-	// 	setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
-	// 	os.Exit(1)
-	// }
-
-	// if err = (&controller.InstanceDiscoveryReconciler{
-	// 	InfraClient: mgr.GetLocalManager().GetClient(),
-	// }).SetupWithManager(mgr); err != nil {
-	// 	setupLog.Error(err, "unable to create controller", "controller", "InstanceDiscoveryReconciler")
-	// 	os.Exit(1)
-	// }
-
 	if err = (&controller.InstanceReconciler{
 		Config:            serverConfig,
 		LocationClassName: locationClassName,
