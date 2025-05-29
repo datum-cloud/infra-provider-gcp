@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -208,6 +209,75 @@ type DownstreamResourceManagementConfig struct {
 	// downstream resources. When not provided, the operator will use the
 	// in-cluster config.
 	KubeconfigPath string `json:"kubeconfigPath"`
+
+	// ProviderConfigStrategy is the strategy to use to identify the ProviderConfig
+	// to use when managing downstream resources.
+	ProviderConfigStrategy ProviderConfigStrategy `json:"providerConfigStrategy"`
+}
+
+type ProviderConfigStrategyMode string
+
+const (
+	// ProviderConfigStrategyModeSingle will result in the operator to use a single
+	// provider config for all downstream resources. This is the default mode, and
+	// requires that the `name` field is set.
+	ProviderConfigStrategyModeSingle ProviderConfigStrategyMode = "single"
+
+	// ProviderConfigStrategyModeDiscovery will result in the operator to use the
+	// discovery cluster name as the provider config name.
+	ProviderConfigStrategyModeDiscovery ProviderConfigStrategyMode = "discovery"
+)
+
+// +k8s:deepcopy-gen=true
+
+type ProviderConfigStrategy struct {
+	// Mode is the mode that the operator should use to identify the ProviderConfig
+	// to use when managing downstream resources.
+	Mode ProviderConfigStrategyMode `json:"mode"`
+
+	// Name can be used to program resources with a single provider config.
+	Single SingleProviderConfigStrategy `json:"single,omitempty"`
+
+	// DiscoveryClusterName will result in the operator to use the discovery cluster
+	// name as the provider config name.
+	Discovery DiscoveryProviderConfigStrategy `json:"discovery,omitempty"`
+}
+
+func (c *ProviderConfigStrategy) GetProviderConfigName(clusterName string) string {
+	switch c.Mode {
+	case ProviderConfigStrategyModeSingle:
+		if c.Single.Name == "" {
+			panic("single provider config strategy name is required")
+		}
+		return c.Single.Name
+	case ProviderConfigStrategyModeDiscovery:
+		if c.Discovery.Prefix == "" {
+			return clusterName
+		}
+		return c.Discovery.Prefix + strings.TrimPrefix(clusterName, "/")
+	default:
+		panic(fmt.Sprintf("unknown provider config strategy mode: %s", c.Mode))
+	}
+}
+
+func SetDefaults_ProviderConfigStrategy(obj *ProviderConfigStrategy) {
+	if obj.Mode == "" {
+		obj.Mode = ProviderConfigStrategyModeSingle
+	}
+}
+
+// +k8s:deepcopy-gen=true
+
+type SingleProviderConfigStrategy struct {
+	// Name is the name of the provider config to use when managing downstream resources.
+	Name string `json:"name,omitempty"`
+}
+
+// +k8s:deepcopy-gen=true
+
+type DiscoveryProviderConfigStrategy struct {
+	// Prefix will be added to the cluster name when locating the provider config.
+	Prefix string `json:"prefix,omitempty"`
 }
 
 func (c *DownstreamResourceManagementConfig) RestConfig() (*rest.Config, error) {

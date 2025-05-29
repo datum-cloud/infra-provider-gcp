@@ -221,6 +221,7 @@ func main() {
 	// }
 
 	if err = (&controller.InstanceReconciler{
+		Config:            serverConfig,
 		LocationClassName: locationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {

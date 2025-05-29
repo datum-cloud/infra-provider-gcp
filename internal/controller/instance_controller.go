@@ -39,6 +39,7 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
@@ -56,6 +57,7 @@ var errResourceIsDeleting = errors.New("resource is deleting")
 // GCP
 type InstanceReconciler struct {
 	mgr               mcmanager.Manager
+	Config            config.GCPProvider
 	LocationClassName string
 	DownstreamCluster cluster.Cluster
 }
@@ -123,7 +125,7 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	// Fetch the ProviderConfig that will be used for Crossplane GCP resources
 	var providerConfig gcpv1beta1.ProviderConfig
 	if err := cl.GetClient().Get(ctx, client.ObjectKey{
-		Name: "project-test-fz3pr6", // TODO
+		Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
 	}, &providerConfig); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching provider config: %w", err)
 	}
