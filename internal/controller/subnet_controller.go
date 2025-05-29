@@ -26,6 +26,7 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
@@ -36,6 +37,7 @@ import (
 type SubnetReconciler struct {
 	mgr               mcmanager.Manager
 	finalizers        finalizer.Finalizers
+	Config            config.GCPProvider
 	LocationClassName string
 	DownstreamCluster cluster.Cluster
 }
@@ -147,7 +149,7 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 		downstreamSubnet.Spec = gcpcomputev1beta2.SubnetworkSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
 				ProviderConfigReference: &crossplanecommonv1.Reference{
-					Name: "project-test-fz3pr6", // TODO
+					Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
 				},
 			},
 			ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{

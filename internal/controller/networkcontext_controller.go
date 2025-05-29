@@ -26,6 +26,7 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
@@ -35,6 +36,7 @@ import (
 // ComputeNetwork is created to represent the context within GCP.
 type NetworkContextReconciler struct {
 	mgr               mcmanager.Manager
+	Config            config.GCPProvider
 	DownstreamCluster cluster.Cluster
 	LocationClassName string
 }
@@ -143,7 +145,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		downstreamNetwork.Spec = gcpcomputev1beta1.NetworkSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
 				ProviderConfigReference: &crossplanecommonv1.Reference{
-					Name: "project-test-fz3pr6", // TODO
+					Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
 				},
 			},
 			ForProvider: gcpcomputev1beta1.NetworkParameters{

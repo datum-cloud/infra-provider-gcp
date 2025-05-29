@@ -214,6 +214,7 @@ func main() {
 	}
 
 	if err = (&controller.SubnetReconciler{
+		Config:            serverConfig,
 		LocationClassName: locationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
@@ -222,6 +223,7 @@ func main() {
 	}
 
 	if err = (&controller.NetworkContextReconciler{
+		Config:            serverConfig,
 		LocationClassName: locationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
