@@ -300,6 +300,11 @@ github.com/zclconf/go-cty-debug v0.0.0-20191215020915-b22d67c1ba0b h1:FosyBZYxY3
 github.com/zclconf/go-cty-debug v0.0.0-20191215020915-b22d67c1ba0b/go.mod h1:ZRKQfBXbGkpdV6QMzT3rU1kSTAnfu1dO8dPKjYprgj8=
 go.datum.net/network-services-operator v0.1.0 h1:PAXOZ5DdJFgRoeVBPIXhqkCm6DxbP4tVOPcr3Y7h/So=
 go.datum.net/network-services-operator v0.1.0/go.mod h1:uloVfxqE+8DgSiMB651X8UC9yECpXbwp/NBstofCceE=
+go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae h1:D4teUska41pOSS/gsz/e3woe/YBhhbh+FT3vqAH73Eo=
+go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae/go.mod h1:uloVfxqE+8DgSiMB651X8UC9yECpXbwp/NBstofCceE=
+go.datum.net/workload-operator v0.0.0-20241205164213-161fb5150fb8/go.mod h1:0zt3wEOy4gLYdOPvErnxLkcE+T2DsjpPmXGANmiUTdQ=
+go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50 h1:b64nFXzX5ZWz7M4PtZV4vkZBmTS7BRJBiGYsr2ybhAY=
+go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50/go.mod h1:saBUHORJ1tkK4vFG2dhiTfvLiElLDtsQHaOxV43Drxc=
 go.opencensus.io v0.24.0 h1:y73uSU6J157QMP2kn2r30vwW1A2W2WFwSCGnAVxeaD0=
 go.opencensus.io v0.24.0/go.mod h1:vNK8G9p7aAivkbmorf4v+7Hgx+Zs0yY+0fOtgBfjQKo=
 go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.54.0 h1:TT4fX+nBOA/+LUkobKGW1ydGcn+G3vRw9+g5HwCphpk=
