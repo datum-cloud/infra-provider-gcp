@@ -1093,7 +1093,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status == corev1.ConditionTrue &&
 		ptr.Deref(gcpInstance.Status.AtProvider.CurrentStatus, "") == "STOPPING" {
 		logger.Info("instance is in STOPPING state, retrying create", "instance", gcpInstance.Name)
-		// Add an annotation to the GCP instance to have crossplane proces it again.
+		// Add an annotation to the GCP instance to have crossplane process it again.
 		gcpInstance.Annotations["compute.datumapis.com/infra-provider-gcp-retry-create"] = time.Now().Format(time.RFC3339)
 		if err := r.DownstreamCluster.GetClient().Update(ctx, gcpInstance); err != nil {
 			return nil, fmt.Errorf("failed to update instance with retry annotation: %w", err)
