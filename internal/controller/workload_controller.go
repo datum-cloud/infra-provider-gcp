@@ -95,7 +95,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 				},
 			}
 
-			if err := cl.GetClient().List(ctx, &firewallRules, listOpts...); err != nil {
+			if err := downstreamStrategy.GetClient().List(ctx, &firewallRules, listOpts...); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to list firewall rules: %w", err)
 			}
 
@@ -185,7 +185,7 @@ func (r *WorkloadReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}, mcbuilder.WithEngageWithLocalCluster(false)).
+		}).
 		Named("workload").
 		Complete(r)
 }

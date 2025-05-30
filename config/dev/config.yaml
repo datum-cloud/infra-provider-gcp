@@ -10,7 +10,7 @@ webhookServer:
       namespace: kube-system
 
 downstreamResourceManagement:
-  kubeconfigPath: ../network-services-operator/kind.kubeconfig
+  kubeconfigPath: ../network-services-operator/infra.kubeconfig
   providerConfigStrategy:
     mode: single
     single:

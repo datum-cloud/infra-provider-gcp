@@ -30,12 +30,12 @@ import (
 // - meta.datumapis.com/upstream-owner-cluster-name: the name of the cluster that owns the workload
 // - meta.datumapis.com/upstream-owner-name: the name of the workload
 // - meta.datumapis.com/upstream-owner-namespace: the namespace of the workload
-func EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr mcmanager.Manager) mchandler.TypedEventHandlerFunc[client.Object, mcreconcile.Request] {
+func EnqueueInstancesForWorkloadOwnedDownstreamResource[object client.Object](mgr mcmanager.Manager) mchandler.TypedEventHandlerFunc[object, mcreconcile.Request] {
 	// Return a mchandler.TypedEventHandlerFunc. The clusterName and cluster are
 	// not used.
-	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
+	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[object, mcreconcile.Request] {
 		// Return the handler that will actually enqueue the requests.
-		return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+		return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj object) []mcreconcile.Request {
 			logger := log.FromContext(ctx).WithValues("resource_kind", obj.GetObjectKind().GroupVersionKind().Kind, "resource_name", obj.GetName(), "resource_namespace", obj.GetNamespace())
 
 			annotations := obj.GetAnnotations()

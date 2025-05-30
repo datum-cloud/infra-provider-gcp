@@ -11,6 +11,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	crossplanemeta "github.com/crossplane/crossplane-runtime/pkg/meta"
@@ -45,6 +46,7 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
+	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -140,13 +142,6 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
 	}, &providerConfig); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching provider config: %w", err)
-	}
-
-	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, computev1alpha.InstanceProgrammed) {
-		if instance.Status.Controller != nil && instance.Spec.Controller.TemplateHash == instance.Status.Controller.ObservedTemplateHash {
-			logger.Info("instance is already programmed")
-			return ctrl.Result{}, nil
-		}
 	}
 
 	workloadDeploymentRef := metav1.GetControllerOf(&instance)
@@ -291,6 +286,11 @@ func (r *InstanceReconciler) reconcileInstance(
 			return ctrl.Result{}, fmt.Errorf("failed to create workload's service account: %w", err)
 		}
 	}
+
+	// TODO(jreese) use "Observe" mode resources to check on service account
+	// status. I've ran into a condition in testing where the service account
+	// was not found by the instance, which resulted in the create operation
+	// being rejected.
 
 	// See if there's been a failure to create the service account.
 	if condition := serviceAccount.Status.GetCondition("LastAsyncOperation"); condition.Reason == "AsyncCreateFailure" {
@@ -1077,6 +1077,30 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 
 	logger.Info("downstream instance processed", "operation_result", result)
 
+	// There's a race condition where the instance is created, but the service
+	// account is not yet ready, which results in Crossplane thinking the instance
+	// exists, but GCP has torn it down. We're not waiting for the service account
+	// to be marked as ready because of a hard coded 10 second sleep inside the
+	// underlying terraform provider.
+	//
+	// We can tell this happens if the Ready condition is True, but the currentStatus
+	// is STOPPING.
+	//
+	// An alternative approach would be to make another Crossplane resource
+	// which is in Observe mode, and periodically probe it by bumping an
+	// annotation. However, since this is a race condition and so far not seen
+	// as all that common, we just deal with the issue if we run into it.
+	if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status == corev1.ConditionTrue &&
+		ptr.Deref(gcpInstance.Status.AtProvider.CurrentStatus, "") == "STOPPING" {
+		logger.Info("instance is in STOPPING state, retrying create", "instance", gcpInstance.Name)
+		// Add an annotation to the GCP instance to have crossplane proces it again.
+		gcpInstance.Annotations["compute.datumapis.com/infra-provider-gcp-retry-create"] = time.Now().Format(time.RFC3339)
+		if err := r.DownstreamCluster.GetClient().Update(ctx, gcpInstance); err != nil {
+			return nil, fmt.Errorf("failed to update instance with retry annotation: %w", err)
+		}
+		return nil, fmt.Errorf("instance created in STOPPING state, retrying create")
+	}
+
 	if err := r.syncInstancePowerState(ctx, upstreamClient, instance, gcpInstance); err != nil {
 		return nil, fmt.Errorf("failed to sync instance power state: %w", err)
 	}
@@ -1529,6 +1553,8 @@ func (r *InstanceReconciler) Finalize(
 		}
 	}
 
+	logger.Info("gcp instance finalizers", "finalizers", gcpInstance.Finalizers)
+
 	// Wait for the instance to be deleted - crossplane doesn't update the
 	// atProvider information or any status conditions when it's successfully
 	// deleted a resource. Observing that the crossplane finalizer has been
@@ -1560,15 +1586,14 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
 
 	return mcbuilder.ControllerManagedBy(mgr).
-		For(&computev1alpha.Instance{}, mcbuilder.WithEngageWithLocalCluster(false)).
-		Watches(&gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr), mcbuilder.WithEngageWithLocalCluster(false)).
-		Watches(&gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr), mcbuilder.WithEngageWithLocalCluster(false)).
-		Watches(&gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource(mgr), mcbuilder.WithEngageWithLocalCluster(false)).
-		Watches(&gcpcomputev1beta2.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+		For(&computev1alpha.Instance{}).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpcloudplatformv1beta1.ServiceAccount](mgr))).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta2.Secret](mgr))).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta1.SecretVersion](mgr))).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Instance, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *gcpcomputev1beta2.Instance) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 
-				instance := obj.(*gcpcomputev1beta2.Instance)
 				upstreamClusterName := instance.Annotations[downstreamclient.UpstreamOwnerClusterName]
 				upstreamName := instance.Annotations[downstreamclient.UpstreamOwnerName]
 				upstreamNamespace := instance.Annotations[downstreamclient.UpstreamOwnerNamespace]
@@ -1590,7 +1615,7 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}, mcbuilder.WithEngageWithLocalCluster(false)).
+		})).
 		Named("instance").
 		Complete(r)
 }

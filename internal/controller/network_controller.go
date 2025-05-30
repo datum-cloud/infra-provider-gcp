@@ -125,7 +125,7 @@ func (r *NetworkReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}, mcbuilder.WithEngageWithLocalCluster(false)).
+		}).
 		Named("network").
 		Complete(r)
 }

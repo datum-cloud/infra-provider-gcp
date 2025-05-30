@@ -30,6 +30,7 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
+	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 )
 
@@ -142,8 +143,14 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 				},
 			},
 			ForProvider: gcpcomputev1beta1.NetworkParameters{
-				Mtu:                   ptr.To(float64(network.Spec.MTU)),
-				AutoCreateSubnetworks: ptr.To(false),
+				Mtu:                                   ptr.To(float64(network.Spec.MTU)),
+				AutoCreateSubnetworks:                 ptr.To(false),
+				NetworkFirewallPolicyEnforcementOrder: ptr.To("AFTER_CLASSIC_FIREWALL"),
+				RoutingMode:                           ptr.To("REGIONAL"),
+				// This is self referencing toward the value in the spec prior to
+				// assignment of our desired state, as Crossplane mutates this value
+				// when resolving the SecretRef value.
+				Project: downstreamNetwork.Spec.ForProvider.Project,
 			},
 		}
 
@@ -192,12 +199,11 @@ func (r *NetworkContextReconciler) SetupWithManager(mgr mcmanager.Manager) error
 	r.mgr = mgr
 
 	return mcbuilder.ControllerManagedBy(mgr).
-		For(&networkingv1alpha.NetworkContext{}, mcbuilder.WithEngageWithLocalCluster(false)).
-		Watches(&gcpcomputev1beta1.Network{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+		For(&networkingv1alpha.NetworkContext{}).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta1.Network{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta1.Network, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, network *gcpcomputev1beta1.Network) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 
-				network := obj.(*gcpcomputev1beta1.Network)
 				upstreamClusterName := network.Annotations[downstreamclient.UpstreamOwnerClusterName]
 
 				if upstreamClusterName == "" {
@@ -231,12 +237,12 @@ func (r *NetworkContextReconciler) SetupWithManager(mgr mcmanager.Manager) error
 								Name:      networkContext.Name,
 							},
 						},
-						ClusterName: clusterName,
+						ClusterName: upstreamClusterName,
 					})
 				}
 
 				return requests
 			})
-		}, mcbuilder.WithEngageWithLocalCluster(false)).
+		})).
 		Complete(r)
 }

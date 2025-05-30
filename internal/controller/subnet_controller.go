@@ -29,6 +29,7 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
+	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 )
 
@@ -213,12 +214,11 @@ func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	}
 
 	return mcbuilder.ControllerManagedBy(mgr).
-		For(&networkingv1alpha.Subnet{}, mcbuilder.WithEngageWithLocalCluster(false)).
-		Watches(&gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+		For(&networkingv1alpha.Subnet{}).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Subnetwork, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, subnet *gcpcomputev1beta2.Subnetwork) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 
-				subnet := obj.(*gcpcomputev1beta2.Subnetwork)
 				upstreamClusterName := subnet.Annotations[downstreamclient.UpstreamOwnerClusterName]
 				upstreamName := subnet.Annotations[downstreamclient.UpstreamOwnerName]
 				upstreamNamespace := subnet.Annotations[downstreamclient.UpstreamOwnerNamespace]
@@ -240,7 +240,7 @@ func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 					},
 				}
 			})
-		}, mcbuilder.WithEngageWithLocalCluster(false)).
+		})).
 		Named("subnet").
 		Complete(r)
 }
