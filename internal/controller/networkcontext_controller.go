@@ -167,7 +167,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 	if downstreamNetwork.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("GCP network not ready yet")
 
-		programmedCondition.Status = metav1.ConditionTrue
+		programmedCondition.Status = metav1.ConditionFalse
 		programmedCondition.Reason = networkingv1alpha.NetworkContextProgrammedReasonProgrammingInProgress
 		programmedCondition.Message = "Network is being programmed."
 

@@ -16,7 +16,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/finalizer"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -137,47 +136,47 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 		},
 	}
 
-	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), downstreamSubnet, func() error {
-		if downstreamSubnet.Annotations == nil {
-			downstreamSubnet.Annotations = make(map[string]string)
-		}
-
-		downstreamSubnet.Annotations[downstreamclient.UpstreamOwnerName] = subnet.Name
-		downstreamSubnet.Annotations[downstreamclient.UpstreamOwnerNamespace] = subnet.Namespace
-		downstreamSubnet.Annotations[downstreamclient.UpstreamOwnerClusterName] = req.ClusterName
-
-		downstreamSubnet.Spec = gcpcomputev1beta2.SubnetworkSpec{
-			ResourceSpec: crossplanecommonv1.ResourceSpec{
-				ProviderConfigReference: &crossplanecommonv1.Reference{
-					Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
-				},
-			},
-			ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{
-				IPCidrRange: ptr.To(fmt.Sprintf("%s/%d", *subnet.Status.StartAddress, *subnet.Status.PrefixLength)),
-				NetworkRef: &crossplanecommonv1.Reference{
-					Name: fmt.Sprintf("network-%s", network.UID),
-				},
-				Region:    ptr.To(location.Spec.Provider.GCP.Region),
-				Purpose:   ptr.To("PRIVATE"),
-				StackType: ptr.To("IPV4_ONLY"),
-			},
-		}
-		return nil
-	})
-
-	if err != nil {
-		if apierrors.IsConflict(err) {
-			return ctrl.Result{Requeue: true}, nil
-		}
-		return ctrl.Result{}, err
+	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKey{Name: downstreamSubnet.Name}, downstreamSubnet); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get downstream subnet: %w", err)
 	}
 
-	logger.Info("downstream subnet processed", "operation_result", result)
+	if downstreamSubnet.CreationTimestamp.IsZero() {
+		downstreamSubnet = &gcpcomputev1beta2.Subnetwork{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("subnet-%s", subnet.UID),
+				Annotations: map[string]string{
+					downstreamclient.UpstreamOwnerName:        subnet.Name,
+					downstreamclient.UpstreamOwnerNamespace:   subnet.Namespace,
+					downstreamclient.UpstreamOwnerClusterName: req.ClusterName,
+				},
+			},
+			Spec: gcpcomputev1beta2.SubnetworkSpec{
+				ResourceSpec: crossplanecommonv1.ResourceSpec{
+					ProviderConfigReference: &crossplanecommonv1.Reference{
+						Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
+					},
+				},
+				ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{
+					IPCidrRange: ptr.To(fmt.Sprintf("%s/%d", *subnet.Status.StartAddress, *subnet.Status.PrefixLength)),
+					NetworkRef: &crossplanecommonv1.Reference{
+						Name: fmt.Sprintf("network-%s", network.UID),
+					},
+					Region:    ptr.To(location.Spec.Provider.GCP.Region),
+					Purpose:   ptr.To("PRIVATE"),
+					StackType: ptr.To("IPV4_ONLY"),
+				},
+			},
+		}
+
+		if err := r.DownstreamCluster.GetClient().Create(ctx, downstreamSubnet); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create downstream subnet: %w", err)
+		}
+	}
 
 	if downstreamSubnet.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("GCP subnet not ready yet")
 
-		programmedCondition.Status = metav1.ConditionTrue
+		programmedCondition.Status = metav1.ConditionFalse
 		programmedCondition.Reason = networkingv1alpha.SubnetProgrammedReasonProgrammingInProgress
 		programmedCondition.Message = "Subnet is being programmed."
 
