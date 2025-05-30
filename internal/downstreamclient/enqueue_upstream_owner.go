@@ -1,8 +1,9 @@
-package crossclusterutil
+package downstreamclient
 
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -10,12 +11,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 )
 
-var _ handler.EventHandler = &enqueueRequestForOwner[client.Object]{}
+var _ mchandler.EventHandler = &enqueueRequestForOwner[client.Object]{}
 
 type empty struct{}
 
@@ -23,14 +27,18 @@ type empty struct{}
 //
 // This handler depends on the `compute.datumapis.com/upstream-namespace` label
 // to exist on the resource for the event.
-func TypedEnqueueRequestForUpstreamOwner[object client.Object](scheme *runtime.Scheme, ownerType client.Object) handler.TypedEventHandler[object, reconcile.Request] {
-	e := &enqueueRequestForOwner[object]{
-		ownerType: ownerType,
+func TypedEnqueueRequestForUpstreamOwner[object client.Object](ownerType client.Object) mchandler.TypedEventHandlerFunc[object, mcreconcile.Request] {
+
+	return func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[object, mcreconcile.Request] {
+		e := &enqueueRequestForOwner[object]{
+			ownerType: ownerType,
+		}
+		if err := e.parseOwnerTypeGroupKind(cl.GetScheme()); err != nil {
+			panic(err)
+		}
+
+		return e
 	}
-	if err := e.parseOwnerTypeGroupKind(scheme); err != nil {
-		panic(err)
-	}
-	return e
 }
 
 type enqueueRequestForOwner[object client.Object] struct {
@@ -42,8 +50,8 @@ type enqueueRequestForOwner[object client.Object] struct {
 }
 
 // Create implements EventHandler.
-func (e *enqueueRequestForOwner[object]) Create(ctx context.Context, evt event.TypedCreateEvent[object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	reqs := map[reconcile.Request]empty{}
+func (e *enqueueRequestForOwner[object]) Create(ctx context.Context, evt event.TypedCreateEvent[object], q workqueue.TypedRateLimitingInterface[mcreconcile.Request]) {
+	reqs := map[mcreconcile.Request]empty{}
 	e.getOwnerReconcileRequest(evt.Object, reqs)
 	for req := range reqs {
 		q.Add(req)
@@ -51,8 +59,8 @@ func (e *enqueueRequestForOwner[object]) Create(ctx context.Context, evt event.T
 }
 
 // Update implements EventHandler.
-func (e *enqueueRequestForOwner[object]) Update(ctx context.Context, evt event.TypedUpdateEvent[object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	reqs := map[reconcile.Request]empty{}
+func (e *enqueueRequestForOwner[object]) Update(ctx context.Context, evt event.TypedUpdateEvent[object], q workqueue.TypedRateLimitingInterface[mcreconcile.Request]) {
+	reqs := map[mcreconcile.Request]empty{}
 	e.getOwnerReconcileRequest(evt.ObjectOld, reqs)
 	e.getOwnerReconcileRequest(evt.ObjectNew, reqs)
 	for req := range reqs {
@@ -61,8 +69,8 @@ func (e *enqueueRequestForOwner[object]) Update(ctx context.Context, evt event.T
 }
 
 // Delete implements EventHandler.
-func (e *enqueueRequestForOwner[object]) Delete(ctx context.Context, evt event.TypedDeleteEvent[object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	reqs := map[reconcile.Request]empty{}
+func (e *enqueueRequestForOwner[object]) Delete(ctx context.Context, evt event.TypedDeleteEvent[object], q workqueue.TypedRateLimitingInterface[mcreconcile.Request]) {
+	reqs := map[mcreconcile.Request]empty{}
 	e.getOwnerReconcileRequest(evt.Object, reqs)
 	for req := range reqs {
 		q.Add(req)
@@ -70,8 +78,8 @@ func (e *enqueueRequestForOwner[object]) Delete(ctx context.Context, evt event.T
 }
 
 // Generic implements EventHandler.
-func (e *enqueueRequestForOwner[object]) Generic(ctx context.Context, evt event.TypedGenericEvent[object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	reqs := map[reconcile.Request]empty{}
+func (e *enqueueRequestForOwner[object]) Generic(ctx context.Context, evt event.TypedGenericEvent[object], q workqueue.TypedRateLimitingInterface[mcreconcile.Request]) {
+	reqs := map[mcreconcile.Request]empty{}
 	e.getOwnerReconcileRequest(evt.Object, reqs)
 	for req := range reqs {
 		q.Add(req)
@@ -97,13 +105,18 @@ func (e *enqueueRequestForOwner[object]) parseOwnerTypeGroupKind(scheme *runtime
 
 // getOwnerReconcileRequest looks at object and builds a map of reconcile.Request to reconcile
 // owners of object that match e.OwnerType.
-func (e *enqueueRequestForOwner[object]) getOwnerReconcileRequest(obj metav1.Object, result map[reconcile.Request]empty) {
-	labels := obj.GetLabels()
-	if labels[UpstreamOwnerKindLabel] == e.groupKind.Kind && labels[UpstreamOwnerGroupLabel] == e.groupKind.Group {
-		request := reconcile.Request{NamespacedName: types.NamespacedName{
-			Name:      labels[UpstreamOwnerNameLabel],
-			Namespace: labels[UpstreamOwnerNamespaceLabel],
-		}}
+func (e *enqueueRequestForOwner[object]) getOwnerReconcileRequest(obj metav1.Object, result map[mcreconcile.Request]empty) {
+	annotations := obj.GetAnnotations()
+	if annotations[UpstreamOwnerKind] == e.groupKind.Kind && annotations[UpstreamOwnerGroup] == e.groupKind.Group {
+		request := mcreconcile.Request{
+			Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      annotations[UpstreamOwnerName],
+					Namespace: annotations[UpstreamOwnerNamespace],
+				},
+			},
+			ClusterName: strings.TrimPrefix(strings.ReplaceAll(annotations[UpstreamOwnerClusterName], "_", "/"), "cluster-"),
+		}
 		result[request] = empty{}
 	}
 }

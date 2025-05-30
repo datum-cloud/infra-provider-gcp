@@ -5,126 +5,70 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - compute.cnrm.cloud.google.com
+  - compute.datumapis.com
   resources:
-  - computeaddresses
-  - computebackendservices
-  - computefirewalls
-  - computeforwardingrules
-  - computehealthchecks
-  - computeinstancegroupmanagers
-  - computeinstancetemplates
-  - computenetworks
-  - computesubnetworks
-  - computetargettcpproxies
+  - instances
   verbs:
-  - create
-  - delete
   - get
   - list
+  - watch
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - instances/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - compute.datumapis.com
+  resources:
+  - instances/status
+  verbs:
+  - get
   - patch
   - update
-  - watch
 - apiGroups:
-  - compute.cnrm.cloud.google.com
+  - ""
   resources:
-  - computeaddresses/status
-  - computebackendservices/status
-  - computefirewalls/status
-  - computeforwardingrules/status
-  - computehealthchecks/status
-  - computeinstancegroupmanager/status
-  - computeinstancegroupmanagers/status
-  - computeinstancetemplates/status
-  - computenetworks/status
-  - computesubnetworks/status
-  - computetargettcpproxies/status
-  verbs:
-  - get
-- apiGroups:
-  - compute.cnrm.cloud.google.com
-  resources:
-  - computeinstancegroupmanager
+  - namespaces
   verbs:
   - get
   - list
   - watch
 - apiGroups:
-  - compute.datumapis.com
+  - networking.datumapis.com
   resources:
   - networkcontexts
+  - networks
   verbs:
   - get
   - list
   - watch
 - apiGroups:
-  - compute.datumapis.com
+  - networking.datumapis.com
   resources:
   - networkcontexts/finalizers
-  - workloaddeployments/finalizers
+  - networks/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - networking.datumapis.com
+  resources:
+  - networkcontexts/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - workload.datumapis.com
+  resources:
+  - workloads
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - workload.datumapis.com
+  resources:
   - workloads/finalizers
   verbs:
   - update
-- apiGroups:
-  - compute.datumapis.com
-  resources:
-  - networkcontexts/status
-  - workloaddeployments/status
-  - workloads/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - compute.datumapis.com
-  resources:
-  - workloaddeployments
-  - workloads
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - iam.cnrm.cloud.google.com
-  resources:
-  - iampolicies
-  - iamserviceaccounts
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - iam.cnrm.cloud.google.com
-  resources:
-  - iampolicies/status
-  - iamserviceaccounts/status
-  verbs:
-  - get
-- apiGroups:
-  - secretmanager.cnrm.cloud.google.com
-  resources:
-  - secretmanagersecrets
-  - secretmanagersecretversions
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - secretmanager.cnrm.cloud.google.com
-  resources:
-  - secretmanagersecrets/status
-  - secretmanagersecretversions/status
-  verbs:
-  - get
