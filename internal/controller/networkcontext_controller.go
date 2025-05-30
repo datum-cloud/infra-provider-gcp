@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
@@ -93,14 +94,8 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 	}
 
 	defer func() {
-		if err != nil {
-			// Don't update the status if errors are encountered
-			return
-		}
-		statusChanged := apimeta.SetStatusCondition(&networkContext.Status.Conditions, programmedCondition)
-
-		if statusChanged {
-			err = cl.GetClient().Status().Update(ctx, &networkContext)
+		if apimeta.SetStatusCondition(&networkContext.Status.Conditions, programmedCondition) {
+			err = errors.Join(err, cl.GetClient().Status().Update(ctx, &networkContext))
 		}
 	}()
 
@@ -163,6 +158,17 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 	}
 
 	logger.Info("downstream network processed", "operation_result", result)
+
+	// See if there's been a failure to create the network.
+	//
+	// NOTE(jreese): Odd observation - the ServiceAccount failure info is in a different
+	// condition. Need to look into that.
+	if condition := downstreamNetwork.Status.GetCondition(crossplanecommonv1.TypeSynced); condition.Reason == "ReconcileError" {
+		logger.Info("network failed to create")
+		programmedCondition.Reason = "NetworkFailedToCreate"
+		programmedCondition.Message = fmt.Sprintf("Network failed to create: %s", condition.Message)
+		return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
+	}
 
 	if downstreamNetwork.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("GCP network not ready yet")
