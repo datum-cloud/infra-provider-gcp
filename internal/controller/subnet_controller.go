@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
@@ -100,14 +101,8 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 	}
 
 	defer func() {
-		if err != nil {
-			// Don't update the status if errors are encountered
-			return
-		}
-		statusChanged := apimeta.SetStatusCondition(&subnet.Status.Conditions, programmedCondition)
-
-		if statusChanged {
-			err = cl.GetClient().Status().Update(ctx, &subnet)
+		if apimeta.SetStatusCondition(&subnet.Status.Conditions, programmedCondition) {
+			err = errors.Join(err, cl.GetClient().Status().Update(ctx, &subnet))
 		}
 	}()
 
