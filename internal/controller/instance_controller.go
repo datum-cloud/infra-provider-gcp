@@ -106,12 +106,14 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return ctrl.Result{}, nil
 	}
 
-	_, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), *instance.Spec.Location, r.LocationClassName)
+	location, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), *instance.Spec.Location, r.LocationClassName)
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if !shouldProcess {
 		return ctrl.Result{}, nil
 	}
+
+	gcpProject := location.Spec.Provider.GCP.ProjectID
 
 	logger.Info("reconciling instance")
 	defer logger.Info("reconcile complete")
@@ -139,7 +141,7 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	// Fetch the ProviderConfig that will be used for Crossplane GCP resources
 	var providerConfig gcpv1beta1.ProviderConfig
 	if err := cl.GetClient().Get(ctx, client.ObjectKey{
-		Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
+		Name: r.Config.GetProviderConfigName(req.ClusterName),
 	}, &providerConfig); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching provider config: %w", err)
 	}
@@ -175,9 +177,26 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 
 	runtime := instance.Spec.Runtime
 	if runtime.Sandbox != nil {
-		return r.reconcileSandboxRuntimeInstance(ctx, req.ClusterName, providerConfig, cl.GetClient(), &workload, &workloadDeployment, &instance)
+		return r.reconcileSandboxRuntimeInstance(
+			ctx,
+			req.ClusterName,
+			providerConfig,
+			gcpProject,
+			cl.GetClient(),
+			&workload,
+			&workloadDeployment,
+			&instance)
 	} else if runtime.VirtualMachine != nil {
-		return r.reconcileVMRuntimeInstance(ctx, req.ClusterName, providerConfig, cl.GetClient(), &workload, &workloadDeployment, &instance)
+		return r.reconcileVMRuntimeInstance(
+			ctx,
+			req.ClusterName,
+			providerConfig,
+			gcpProject,
+			cl.GetClient(),
+			&workload,
+			&workloadDeployment,
+			&instance,
+		)
 	}
 
 	return ctrl.Result{}, nil
@@ -187,6 +206,7 @@ func (r *InstanceReconciler) reconcileInstance(
 	ctx context.Context,
 	clusterName string,
 	providerConfig gcpv1beta1.ProviderConfig,
+	gcpProject string,
 	upstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -224,7 +244,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		}
 	}()
 
-	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, providerConfig, upstreamClient, workload, workloadDeployment); err != nil {
+	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, providerConfig, gcpProject, upstreamClient, workload, workloadDeployment); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
 	}
 
@@ -277,6 +297,7 @@ func (r *InstanceReconciler) reconcileInstance(
 					},
 				},
 				ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
+					Project:     ptr.To(gcpProject),
 					Description: ptr.To(fmt.Sprintf("service account for workload %s", workload.UID)),
 				},
 			},
@@ -316,6 +337,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		ctx,
 		clusterName,
 		providerConfig,
+		gcpProject,
 		upstreamClient,
 		&programmedCondition,
 		cloudConfig,
@@ -342,6 +364,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		clusterName,
 		providerConfig,
 		upstreamClient,
+		gcpProject,
 		gcpZone,
 		workload,
 		workloadDeployment,
@@ -396,6 +419,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
 	providerConfig gcpv1beta1.ProviderConfig,
+	gcpProject string,
 	client client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -582,6 +606,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 		ctx,
 		clusterName,
 		providerConfig,
+		gcpProject,
 		client,
 		workload,
 		workloadDeployment,
@@ -595,6 +620,7 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
 	providerConfig gcpv1beta1.ProviderConfig,
+	gcpProject string,
 	client client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -663,6 +689,7 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 		ctx,
 		clusterName,
 		providerConfig,
+		gcpProject,
 		client,
 		workload,
 		workloadDeployment,
@@ -716,6 +743,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	ctx context.Context,
 	clusterName string,
 	providerConfig gcpv1beta1.ProviderConfig,
+	gcpProject string,
 	upstreamClient client.Client,
 	programmedCondition *metav1.Condition,
 	cloudConfig *cloudinit.CloudConfig,
@@ -823,6 +851,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 					},
 				},
 				ForProvider: gcpsecretmanagerv1beta2.SecretParameters{
+					Project: ptr.To(gcpProject),
 					Replication: &gcpsecretmanagerv1beta2.ReplicationParameters{
 						Auto: &gcpsecretmanagerv1beta2.AutoParameters{},
 					},
@@ -941,11 +970,12 @@ func (r *InstanceReconciler) reconcileSecrets(
 					},
 				},
 				ForProvider: gcpsecretmanagerv1beta2.SecretIAMMemberParameters{
+					Project: ptr.To(gcpProject),
 					SecretIDRef: &crossplanecommonv1.Reference{
 						Name: secret.Name,
 					},
 					Role:   ptr.To("roles/secretmanager.secretAccessor"),
-					Member: ptr.To(fmt.Sprintf("serviceAccount:%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], providerConfig.Spec.ProjectID)),
+					Member: ptr.To(fmt.Sprintf("serviceAccount:%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], gcpProject)),
 				},
 			},
 		}
@@ -983,6 +1013,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	clusterName string,
 	providerConfig gcpv1beta1.ProviderConfig,
 	upstreamClient client.Client,
+	gcpProject string,
 	gcpZone string,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -1045,6 +1076,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 		gcpInstance.Spec.ForProvider.CanIPForward = ptr.To(true)
 		gcpInstance.Spec.ForProvider.Metadata = instanceMetadata
 		gcpInstance.Spec.ForProvider.Hostname = ptr.To(fmt.Sprintf("%s.cloud.datum-dns.net", instance.Name))
+		gcpInstance.Spec.ForProvider.Project = ptr.To(gcpProject)
 		gcpInstance.Spec.ForProvider.Zone = ptr.To(gcpZone)
 
 		if gcpInstance.Spec.ForProvider.ServiceAccount == nil {
@@ -1052,7 +1084,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 				Scopes: []*string{
 					ptr.To("cloud-platform"),
 				},
-				Email: ptr.To(fmt.Sprintf("%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], providerConfig.Spec.ProjectID)),
+				Email: ptr.To(fmt.Sprintf("%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], gcpProject)),
 			}
 		}
 		gcpInstance.Spec.ForProvider.Tags = []*string{
@@ -1308,6 +1340,7 @@ func (r *InstanceReconciler) buildGCPInstanceNetworkInterfaces(
 func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 	ctx context.Context,
 	providerConfig gcpv1beta1.ProviderConfig,
+	gcpProject string,
 	upstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -1386,6 +1419,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 							},
 						},
 						ForProvider: gcpcomputev1beta2.FirewallParameters{
+							Project: ptr.To(gcpProject),
 							Description: ptr.To(fmt.Sprintf(
 								"instance interface policy for %s: interfaceIndex:%d, ruleIndex:%d",
 								workloadDeployment.Name,

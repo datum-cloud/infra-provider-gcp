@@ -149,7 +149,7 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 			Spec: gcpcomputev1beta2.SubnetworkSpec{
 				ResourceSpec: crossplanecommonv1.ResourceSpec{
 					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
+						Name: r.Config.GetProviderConfigName(req.ClusterName),
 					},
 				},
 				ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{
@@ -157,6 +157,7 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 					NetworkRef: &crossplanecommonv1.Reference{
 						Name: fmt.Sprintf("network-%s", network.UID),
 					},
+					Project:   ptr.To(location.Spec.Provider.GCP.ProjectID),
 					Region:    ptr.To(location.Spec.Provider.GCP.Region),
 					Purpose:   ptr.To("PRIVATE"),
 					StackType: ptr.To("IPV4_ONLY"),

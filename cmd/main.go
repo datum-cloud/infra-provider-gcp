@@ -345,6 +345,7 @@ func initializeClusterDiscovery(
 			},
 			InternalServiceDiscovery: serverConfig.Discovery.InternalServiceDiscovery,
 			ProjectRestConfig:        projectRestConfig,
+			LabelSelector:            serverConfig.Discovery.LabelSelector,
 		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("unable to create datum project provider: %w", err)

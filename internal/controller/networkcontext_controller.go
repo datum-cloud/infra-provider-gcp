@@ -67,7 +67,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		return ctrl.Result{}, err
 	}
 
-	_, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), networkContext.Spec.Location, r.LocationClassName)
+	location, shouldProcess, err := locationutil.GetLocation(ctx, cl.GetClient(), networkContext.Spec.Location, r.LocationClassName)
 	if err != nil {
 		return ctrl.Result{}, err
 	} else if !shouldProcess {
@@ -139,7 +139,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		downstreamNetwork.Spec = gcpcomputev1beta1.NetworkSpec{
 			ResourceSpec: crossplanecommonv1.ResourceSpec{
 				ProviderConfigReference: &crossplanecommonv1.Reference{
-					Name: r.Config.DownstreamResourceManagement.ProviderConfigStrategy.GetProviderConfigName(req.ClusterName),
+					Name: r.Config.GetProviderConfigName(req.ClusterName),
 				},
 			},
 			ForProvider: gcpcomputev1beta1.NetworkParameters{
@@ -147,10 +147,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 				AutoCreateSubnetworks:                 ptr.To(false),
 				NetworkFirewallPolicyEnforcementOrder: ptr.To("AFTER_CLASSIC_FIREWALL"),
 				RoutingMode:                           ptr.To("REGIONAL"),
-				// This is self referencing toward the value in the spec prior to
-				// assignment of our desired state, as Crossplane mutates this value
-				// when resolving the SecretRef value.
-				Project: downstreamNetwork.Spec.ForProvider.Project,
+				Project:                               ptr.To(location.Spec.Provider.GCP.ProjectID),
 			},
 		}
 

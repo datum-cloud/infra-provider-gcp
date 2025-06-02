@@ -12,6 +12,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
@@ -22,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -53,6 +55,10 @@ type Options struct {
 	// API endpoints. If not provided, the provider will use the rest config
 	// from the local manager.
 	ProjectRestConfig *rest.Config
+
+	// LabelSelector is an optional selector to filter projects based on labels.
+	// When provided, only projects matching this selector will be reconciled.
+	LabelSelector *metav1.LabelSelector
 }
 
 // New creates a new Datum cluster Provider.
@@ -77,10 +83,25 @@ func New(localMgr manager.Manager, opts Options) (*Provider, error) {
 		project.SetGroupVersionKind(projectGVK)
 	}
 
-	if err := builder.ControllerManagedBy(localMgr).
-		For(&project).
-		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
-		Complete(p); err != nil {
+	var forOpts []builder.ForOption
+	if opts.LabelSelector != nil {
+		selector, err := metav1.LabelSelectorAsSelector(opts.LabelSelector)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create selector from label selector: %w", err)
+		}
+
+		labelPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return selector.Matches(labels.Set(obj.GetLabels()))
+		})
+
+		forOpts = append(forOpts, builder.WithPredicates(labelPredicate))
+	}
+
+	controllerBuilder := builder.ControllerManagedBy(localMgr).
+		For(&project, forOpts...).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1})
+
+	if err := controllerBuilder.Complete(p); err != nil {
 		return nil, fmt.Errorf("failed to create controller: %w", err)
 	}
 

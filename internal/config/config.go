@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -215,25 +216,9 @@ type DownstreamResourceManagementConfig struct {
 	ProviderConfigStrategy ProviderConfigStrategy `json:"providerConfigStrategy"`
 }
 
-type ProviderConfigStrategyMode string
-
-const (
-	// ProviderConfigStrategyModeSingle will result in the operator to use a single
-	// provider config for all downstream resources. This is the default mode, and
-	// requires that the `name` field is set.
-	ProviderConfigStrategyModeSingle ProviderConfigStrategyMode = "single"
-
-	// ProviderConfigStrategyModeDiscovery will result in the operator to use the
-	// discovery cluster name as the provider config name.
-	ProviderConfigStrategyModeDiscovery ProviderConfigStrategyMode = "discovery"
-)
-
 // +k8s:deepcopy-gen=true
 
 type ProviderConfigStrategy struct {
-	// Mode is the mode that the operator should use to identify the ProviderConfig
-	// to use when managing downstream resources.
-	Mode ProviderConfigStrategyMode `json:"mode"`
 
 	// Name can be used to program resources with a single provider config.
 	Single SingleProviderConfigStrategy `json:"single,omitempty"`
@@ -243,26 +228,18 @@ type ProviderConfigStrategy struct {
 	Discovery DiscoveryProviderConfigStrategy `json:"discovery,omitempty"`
 }
 
-func (c *ProviderConfigStrategy) GetProviderConfigName(clusterName string) string {
-	switch c.Mode {
-	case ProviderConfigStrategyModeSingle:
-		if c.Single.Name == "" {
+func (c *GCPProvider) GetProviderConfigName(clusterName string) string {
+	switch c.Discovery.Mode {
+	case providers.ProviderSingle:
+		if c.DownstreamResourceManagement.ProviderConfigStrategy.Single.Name == "" {
 			panic("single provider config strategy name is required")
 		}
-		return c.Single.Name
-	case ProviderConfigStrategyModeDiscovery:
-		if c.Discovery.Prefix == "" {
+		return c.DownstreamResourceManagement.ProviderConfigStrategy.Single.Name
+	default:
+		if c.DownstreamResourceManagement.ProviderConfigStrategy.Discovery.Prefix == "" {
 			return clusterName
 		}
-		return c.Discovery.Prefix + strings.TrimPrefix(clusterName, "/")
-	default:
-		panic(fmt.Sprintf("unknown provider config strategy mode: %s", c.Mode))
-	}
-}
-
-func SetDefaults_ProviderConfigStrategy(obj *ProviderConfigStrategy) {
-	if obj.Mode == "" {
-		obj.Mode = ProviderConfigStrategyModeSingle
+		return c.DownstreamResourceManagement.ProviderConfigStrategy.Discovery.Prefix + strings.TrimPrefix(clusterName, "/")
 	}
 }
 
@@ -305,10 +282,18 @@ type DiscoveryConfig struct {
 	// config.
 	DiscoveryKubeconfigPath string `json:"discoveryKubeconfigPath"`
 
+	// DiscoveryContext is the context to use for discovery. When not provided,
+	// the operator will use the current-context in the kubeconfig file..
+	DiscoveryContext string `json:"discoveryContext"`
+
 	// ProjectKubeconfigPath is the path to the kubeconfig file to use as a
 	// template when connecting to project control planes. When not provided,
 	// the operator will use the in-cluster config.
 	ProjectKubeconfigPath string `json:"projectKubeconfigPath"`
+
+	// LabelSelector is an optional selector to filter projects based on labels.
+	// When provided, only projects matching this selector will be reconciled.
+	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
 }
 
 func SetDefaults_DiscoveryConfig(obj *DiscoveryConfig) {
@@ -322,7 +307,9 @@ func (c *DiscoveryConfig) DiscoveryRestConfig() (*rest.Config, error) {
 		return ctrl.GetConfig()
 	}
 
-	return clientcmd.BuildConfigFromFlags("", c.DiscoveryKubeconfigPath)
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: c.DiscoveryKubeconfigPath},
+		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{}, CurrentContext: c.DiscoveryContext}).ClientConfig()
 }
 
 func (c *DiscoveryConfig) ProjectRestConfig() (*rest.Config, error) {
