@@ -39,9 +39,6 @@ type WorkloadReconciler struct {
 	LocationClassName string
 }
 
-// +kubebuilder:rbac:groups=workload.datumapis.com,resources=workloads,verbs=get;list;watch
-// +kubebuilder:rbac:groups=workload.datumapis.com,resources=workloads/finalizers,verbs=update
-
 func (r *WorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (_ ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
 

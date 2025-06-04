@@ -34,9 +34,6 @@ type NetworkReconciler struct {
 	LocationClassName string
 }
 
-// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networks,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networks/finalizers,verbs=update
-
 func (r *NetworkReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (_ ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
 

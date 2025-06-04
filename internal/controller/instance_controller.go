@@ -75,10 +75,6 @@ type InstanceReconciler struct {
 	DownstreamCluster cluster.Cluster
 }
 
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances,verbs=get;list;watch
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances/finalizers,verbs=update
-
 func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 

@@ -43,12 +43,6 @@ type NetworkContextReconciler struct {
 	LocationClassName string
 }
 
-// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networkcontexts,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networkcontexts/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=networking.datumapis.com,resources=networkcontexts/finalizers,verbs=update
-
-// TODO(jreese) RBAC for Crossplane resources
-
 func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (_ ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
 
