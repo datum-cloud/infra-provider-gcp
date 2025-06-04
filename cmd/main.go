@@ -14,9 +14,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	kcccomputev1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/compute/v1beta1"
-	kcciamv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/iam/v1beta1"
-	kccsecretmanagerv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/secretmanager/v1beta1"
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta1 "github.com/upbound/provider-gcp/apis/compute/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
@@ -60,10 +57,6 @@ func init() {
 
 	utilruntime.Must(config.AddToScheme(scheme))
 	utilruntime.Must(config.RegisterDefaults(scheme))
-	utilruntime.Must(kcccomputev1beta1.AddToScheme(scheme))
-	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
-	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
-	utilruntime.Must(kccsecretmanagerv1beta1.AddToScheme(scheme))
 
 	utilruntime.Must(gcpv1beta1.SchemeBuilder.AddToScheme(scheme))
 	utilruntime.Must(gcpcomputev1beta1.AddToScheme(scheme))
