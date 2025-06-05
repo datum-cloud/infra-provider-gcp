@@ -1,7 +1,7 @@
 package upstream
 
-// +kubebuilder:rbac:resources=configmaps,verbs=get;list;watch
-// +kubebuilder:rbac:resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances,verbs=get;list;watch
 // +kubebuilder:rbac:groups=compute.datumapis.com,resources=instances/status,verbs=get;update;patch

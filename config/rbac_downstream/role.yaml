@@ -4,7 +4,9 @@ kind: ClusterRole
 metadata:
   name: downstream-manager-role
 rules:
-- resources:
+- apiGroups:
+  - ""
+  resources:
   - configmaps
   - namespaces
   - secrets
