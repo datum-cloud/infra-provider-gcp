@@ -37,6 +37,20 @@ type GCPProvider struct {
 	Discovery DiscoveryConfig `json:"discovery"`
 
 	DownstreamResourceManagement DownstreamResourceManagementConfig `json:"downstreamResourceManagement"`
+
+	// LocationClassName configures the operator to only consider resources
+	// attached to locations with the specified location class. Defaults to
+	// "self-managed".
+	//
+	// TODO(jreese) move to an approach similar to GatewayClass, where a controller
+	// manager is associated with each class, and this will define the controller.
+	LocationClassName string `json:"locationClassName"`
+}
+
+func SetDefaults_GCPProvider(obj *GCPProvider) {
+	if obj.LocationClassName == "" {
+		obj.LocationClassName = "self-managed"
+	}
 }
 
 // +k8s:deepcopy-gen=true

@@ -74,22 +74,11 @@ func main() {
 	var probeAddr string
 	var serverConfigFile string
 
-	var locationClassName string
-
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.StringVar(&leaderElectionNamespace, "leader-elect-namespace", "", "The namespace to use for leader election.")
-
-	// TODO(jreese) move to an approach similar to GatewayClass, where a controller
-	// manager is associated with each class, and this will define the controller.
-	flag.StringVar(
-		&locationClassName,
-		"location-class",
-		"self-managed",
-		"Only consider resources attached to locations with the  specified location class.",
-	)
 
 	opts := zap.Options{
 		Development: true,
@@ -190,7 +179,7 @@ func main() {
 	}
 
 	if err = (&controller.WorkloadReconciler{
-		LocationClassName: locationClassName,
+		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
@@ -199,7 +188,7 @@ func main() {
 
 	if err = (&controller.InstanceReconciler{
 		Config:            serverConfig,
-		LocationClassName: locationClassName,
+		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InstanceReconciler")
@@ -207,7 +196,7 @@ func main() {
 	}
 
 	if err = (&controller.NetworkReconciler{
-		LocationClassName: locationClassName,
+		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkReconciler")
@@ -216,7 +205,7 @@ func main() {
 
 	if err = (&controller.NetworkContextReconciler{
 		Config:            serverConfig,
-		LocationClassName: locationClassName,
+		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
@@ -225,7 +214,7 @@ func main() {
 
 	if err = (&controller.SubnetReconciler{
 		Config:            serverConfig,
-		LocationClassName: locationClassName,
+		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SubnetReconciler")

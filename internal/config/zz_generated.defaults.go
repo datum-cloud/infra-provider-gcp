@@ -18,6 +18,7 @@ func RegisterDefaults(scheme *runtime.Scheme) error {
 }
 
 func SetObjectDefaults_GCPProvider(in *GCPProvider) {
+	SetDefaults_GCPProvider(in)
 	SetDefaults_MetricsServerConfig(&in.MetricsServer)
 	SetDefaults_TLSConfig(&in.MetricsServer.TLS)
 	SetDefaults_TLSConfig(&in.WebhookServer.TLS)

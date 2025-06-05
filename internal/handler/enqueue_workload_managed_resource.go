@@ -46,7 +46,7 @@ func EnqueueInstancesForWorkloadOwnedDownstreamResource[object client.Object](mg
 
 			labels := obj.GetLabels()
 			if labels == nil {
-				logger.Info("resource is missing workload ownership label metadata")
+				logger.V(1).Info("resource is missing workload ownership label metadata")
 				return nil
 			}
 
@@ -57,7 +57,7 @@ func EnqueueInstancesForWorkloadOwnedDownstreamResource[object client.Object](mg
 			workloadUID := labels[computev1alpha.WorkloadUIDLabel]
 
 			if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" || workloadUID == "" {
-				logger.Info(
+				logger.V(1).Info(
 					"resource is missing upstream ownership metadata",
 					"upstream_cluster_name", upstreamClusterName,
 					"upstream_name", upstreamName,
