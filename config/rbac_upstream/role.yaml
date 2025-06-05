@@ -4,6 +4,13 @@ kind: ClusterRole
 metadata:
   name: upstream-manager-role
 rules:
+- resources:
+  - configmaps
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - compute.datumapis.com
   resources:

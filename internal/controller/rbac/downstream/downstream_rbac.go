@@ -1,5 +1,9 @@
 package downstream
 
+// +kubebuilder:rbac:resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:resources=namespaces,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:resources=secrets,verbs=get;list;watch;create;update;patch;delete
+
 // Crossplane GCP resources (downstream control plane)
 // +kubebuilder:rbac:groups=cloudplatform.gcp.upbound.io,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cloudplatform.gcp.upbound.io,resources=serviceaccounts/status,verbs=get

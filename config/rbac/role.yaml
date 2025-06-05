@@ -4,6 +4,18 @@ kind: ClusterRole
 metadata:
   name: manager-role
 rules:
+- resources:
+  - configmaps
+  - namespaces
+  - secrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - cloudplatform.gcp.upbound.io
   resources:
