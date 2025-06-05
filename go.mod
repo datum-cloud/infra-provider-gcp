@@ -12,7 +12,7 @@ require (
 	github.com/stretchr/testify v1.9.0
 	go.datum.net/network-services-operator v0.0.0-20241205161241-d19fee49f0b7
 	go.datum.net/workload-operator v0.0.0-20241205164213-161fb5150fb8
-	google.golang.org/protobuf v1.35.1
+	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.31.1
 	k8s.io/apimachinery v0.31.1
