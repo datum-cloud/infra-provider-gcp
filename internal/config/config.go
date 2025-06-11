@@ -14,7 +14,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -39,18 +38,12 @@ type GCPProvider struct {
 	DownstreamResourceManagement DownstreamResourceManagementConfig `json:"downstreamResourceManagement"`
 
 	// LocationClassName configures the operator to only consider resources
-	// attached to locations with the specified location class. Defaults to
-	// "self-managed".
+	// attached to locations with the specified location class.
 	//
 	// TODO(jreese) move to an approach similar to GatewayClass, where a controller
 	// manager is associated with each class, and this will define the controller.
+	// +default="self-managed"
 	LocationClassName string `json:"locationClassName"`
-}
-
-func SetDefaults_GCPProvider(obj *GCPProvider) {
-	if obj.LocationClassName == "" {
-		obj.LocationClassName = "self-managed"
-	}
 }
 
 // +k8s:deepcopy-gen=true
@@ -61,16 +54,24 @@ type WebhookServerConfig struct {
 	Host string `json:"host"`
 
 	// Port is the port number that the server will serve.
-	// It will be defaulted to 9443 if unspecified.
+	// +default=9443
 	Port int `json:"port"`
 
 	// TLS is the TLS configuration for the webhook server, allowing configuration
 	// of what path to find a certificate and key in, and what file names to use.
+	//
+	// The CertDir field will be defaulted to <temp-dir>/k8s-webhook-server/serving-certs.
 	TLS TLSConfig `json:"tls"`
 
 	// ClientCAName is the CA certificate name which server used to verify remote(client)'s certificate.
 	// Defaults to "", which means server does not verify client's certificate.
 	ClientCAName string `json:"clientCAName"`
+}
+
+func SetDefaults_WebhookServerConfig(obj *WebhookServerConfig) {
+	if obj.TLS.CertDir == "" {
+		obj.TLS.CertDir = filepath.Join(os.TempDir(), "k8s-webhook-server", "serving-certs")
+	}
 }
 
 func (c *WebhookServerConfig) Options(ctx context.Context, secretsClient client.Client) webhook.Options {
@@ -93,28 +94,26 @@ func (c *WebhookServerConfig) Options(ctx context.Context, secretsClient client.
 
 type MetricsServerConfig struct {
 	// SecureServing enables serving metrics via https.
-	// Per default metrics will be served via http.
+	// +default=true
 	SecureServing *bool `json:"secureServing,omitempty"`
 
 	// BindAddress is the bind address for the metrics server.
-	// It will be defaulted to "0" if unspecified.
 	// Use :8443 for HTTPS or :8080 for HTTP
 	//
 	// Set this to "0" to disable the metrics server.
+	// +default="0"
 	BindAddress string `json:"bindAddress"`
 
 	// TLS is the TLS configuration for the metrics server, allowing configuration
 	// of what path to find a certificate and key in, and what file names to use.
+	//
+	// The CertDir field will be defaulted to <temp-dir>/k8s-metrics-server/serving-certs.
 	TLS TLSConfig `json:"tls"`
 }
 
 func SetDefaults_MetricsServerConfig(obj *MetricsServerConfig) {
-	if obj.SecureServing == nil {
-		obj.SecureServing = ptr.To(true)
-	}
-
-	if obj.BindAddress == "" {
-		obj.BindAddress = "0"
+	if len(obj.TLS.CertDir) == 0 {
+		obj.TLS.CertDir = filepath.Join(os.TempDir(), "k8s-metrics-server", "serving-certs")
 	}
 }
 
@@ -153,18 +152,20 @@ type TLSConfig struct {
 	// will be read from the API on every request.
 	SecretRef *corev1.ObjectReference `json:"secretRef,omitempty"`
 
-	// CertDir is the directory that contains the server key and certificate. Defaults to
-	// <temp-dir>/k8s-webhook-server/serving-certs.
+	// CertDir is the directory that contains the server key and certificate.
+	// Default depends on the parent config these settings are contained in.
 	CertDir string `json:"certDir"`
 
-	// CertName is the server certificate name. Defaults to tls.crt.
+	// CertName is the server certificate name.
 	//
 	// Note: This option is only used when TLSOpts does not set GetCertificate.
+	// +default="tls.crt"
 	CertName string `json:"certName"`
 
-	// KeyName is the server key name. Defaults to tls.key.
+	// KeyName is the server key name.
 	//
 	// Note: This option is only used when TLSOpts does not set GetCertificate.
+	// +default="tls.key"
 	KeyName string `json:"keyName"`
 }
 
@@ -201,20 +202,6 @@ func (c *TLSConfig) Options(ctx context.Context, secretsClient client.Client) []
 	}
 
 	return tlsOpts
-}
-
-func SetDefaults_TLSConfig(obj *TLSConfig) {
-	if len(obj.CertDir) == 0 {
-		obj.CertDir = filepath.Join(os.TempDir(), "k8s-metrics-server", "serving-certs")
-	}
-
-	if len(obj.CertName) == 0 {
-		obj.CertName = "tls.crt"
-	}
-
-	if len(obj.KeyName) == 0 {
-		obj.KeyName = "tls.key"
-	}
 }
 
 // +k8s:deepcopy-gen=true
@@ -284,7 +271,7 @@ func (c *DownstreamResourceManagementConfig) RestConfig() (*rest.Config, error) 
 type DiscoveryConfig struct {
 	// Mode is the mode that the operator should use to discover clusters.
 	//
-	// Defaults to "single"
+	// +default="single"
 	Mode providers.Provider `json:"mode"`
 
 	// InternalServiceDiscovery will result in the operator to connect to internal
@@ -308,12 +295,6 @@ type DiscoveryConfig struct {
 	// LabelSelector is an optional selector to filter projects based on labels.
 	// When provided, only projects matching this selector will be reconciled.
 	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
-}
-
-func SetDefaults_DiscoveryConfig(obj *DiscoveryConfig) {
-	if obj.Mode == "" {
-		obj.Mode = providers.ProviderSingle
-	}
 }
 
 func (c *DiscoveryConfig) DiscoveryRestConfig() (*rest.Config, error) {

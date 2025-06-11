@@ -18,9 +18,34 @@ func RegisterDefaults(scheme *runtime.Scheme) error {
 }
 
 func SetObjectDefaults_GCPProvider(in *GCPProvider) {
-	SetDefaults_GCPProvider(in)
 	SetDefaults_MetricsServerConfig(&in.MetricsServer)
-	SetDefaults_TLSConfig(&in.MetricsServer.TLS)
-	SetDefaults_TLSConfig(&in.WebhookServer.TLS)
-	SetDefaults_DiscoveryConfig(&in.Discovery)
+	if in.MetricsServer.SecureServing == nil {
+		var ptrVar1 bool = true
+		in.MetricsServer.SecureServing = &ptrVar1
+	}
+	if in.MetricsServer.BindAddress == "" {
+		in.MetricsServer.BindAddress = "0"
+	}
+	if in.MetricsServer.TLS.CertName == "" {
+		in.MetricsServer.TLS.CertName = "tls.crt"
+	}
+	if in.MetricsServer.TLS.KeyName == "" {
+		in.MetricsServer.TLS.KeyName = "tls.key"
+	}
+	SetDefaults_WebhookServerConfig(&in.WebhookServer)
+	if in.WebhookServer.Port == 0 {
+		in.WebhookServer.Port = 9443
+	}
+	if in.WebhookServer.TLS.CertName == "" {
+		in.WebhookServer.TLS.CertName = "tls.crt"
+	}
+	if in.WebhookServer.TLS.KeyName == "" {
+		in.WebhookServer.TLS.KeyName = "tls.key"
+	}
+	if in.Discovery.Mode == "" {
+		in.Discovery.Mode = "single"
+	}
+	if in.LocationClassName == "" {
+		in.LocationClassName = "self-managed"
+	}
 }
