@@ -44,6 +44,27 @@ type GCPProvider struct {
 	// manager is associated with each class, and this will define the controller.
 	// +default="self-managed"
 	LocationClassName string `json:"locationClassName"`
+
+	// ImageMap is a map of image names to GCP image project/image names.
+	ImageMap map[string]string `json:"imageMap,omitempty"`
+
+	// MachineTypeMap is a map of machine type names to GCP machine type names.
+	MachineTypeMap map[string]string `json:"machineTypeMap,omitempty"`
+}
+
+func SetDefaults_GCPProvider(obj *GCPProvider) {
+	if obj.ImageMap == nil {
+		obj.ImageMap = map[string]string{
+			"datumcloud/ubuntu-2204-lts":           "projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20240927",
+			"datumcloud/cos-stable-117-18613-0-79": "projects/cos-cloud/global/images/cos-stable-117-18613-0-79",
+		}
+	}
+
+	if obj.MachineTypeMap == nil {
+		obj.MachineTypeMap = map[string]string{
+			"datumcloud/d1-standard-2": "n2-standard-2",
+		}
+	}
 }
 
 // +k8s:deepcopy-gen=true

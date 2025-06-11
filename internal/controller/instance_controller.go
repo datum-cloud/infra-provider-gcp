@@ -54,15 +54,6 @@ const crossplaneFinalizer = "finalizer.managedresource.crossplane.io"
 
 var errResourceIsDeleting = errors.New("resource is deleting")
 
-var imageMap = map[string]string{
-	"datumcloud/ubuntu-2204-lts":           "projects/ubuntu-os-cloud/global/images/ubuntu-2204-jammy-v20240927",
-	"datumcloud/cos-stable-117-18613-0-79": "projects/cos-cloud/global/images/cos-stable-117-18613-0-79",
-}
-
-var machineTypeMap = map[string]string{
-	"datumcloud/d1-standard-2": "n2-standard-2",
-}
-
 //go:embed cloudinit/populate_secrets.py
 var populateSecretsScript string
 
@@ -1019,7 +1010,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 		gcpInstance.Annotations[downstreamclient.UpstreamOwnerNamespace] = instance.Namespace
 		gcpInstance.Annotations[downstreamclient.UpstreamOwnerClusterName] = clusterName
 
-		machineType, ok := machineTypeMap[runtimeSpec.Resources.InstanceType]
+		machineType, ok := r.Config.MachineTypeMap[runtimeSpec.Resources.InstanceType]
 		if !ok {
 			return fmt.Errorf("unable to map datum instance type: %s", runtimeSpec.Resources.InstanceType)
 		}
@@ -1151,7 +1142,7 @@ func (r *InstanceReconciler) buildGCPInstanceVolumes(
 				if populator := diskTemplate.Spec.Populator; populator != nil {
 					if populator.Image != nil {
 						// Should be prevented by validation, but be safe
-						sourceImage, ok := imageMap[populator.Image.Name]
+						sourceImage, ok := r.Config.ImageMap[populator.Image.Name]
 						if !ok {
 							return fmt.Errorf("unable to map datum image name: %s", populator.Image.Name)
 						}

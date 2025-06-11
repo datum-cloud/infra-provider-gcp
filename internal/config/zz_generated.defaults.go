@@ -18,6 +18,7 @@ func RegisterDefaults(scheme *runtime.Scheme) error {
 }
 
 func SetObjectDefaults_GCPProvider(in *GCPProvider) {
+	SetDefaults_GCPProvider(in)
 	SetDefaults_MetricsServerConfig(&in.MetricsServer)
 	if in.MetricsServer.SecureServing == nil {
 		var ptrVar1 bool = true
