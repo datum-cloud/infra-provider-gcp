@@ -4,7 +4,7 @@ go 1.23.0
 
 require (
 	cloud.google.com/go/compute v1.29.0
-	github.com/GoogleCloudPlatform/k8s-config-connector v1.125.0
+	github.com/GoogleCloudPlatform/k8s-config-connector v1.132.0
 	github.com/go-logr/logr v1.4.2
 	github.com/googleapis/gax-go/v2 v2.14.0
 	github.com/onsi/ginkgo/v2 v2.19.0
