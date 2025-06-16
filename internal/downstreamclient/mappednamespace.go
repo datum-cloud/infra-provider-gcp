@@ -105,7 +105,7 @@ func (c *mappedNamespaceResourceStrategy) ensureDownstreamNamespace(ctx context.
 			fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_")),
 		)
 
-		maps.Copy(downstreamNamespace.ObjectMeta.Labels, c.managedResourceLabels)
+		maps.Copy(downstreamNamespace.Labels, c.managedResourceLabels)
 
 		return nil
 	})
