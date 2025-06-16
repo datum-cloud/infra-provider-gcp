@@ -150,6 +150,14 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return ctrl.Result{}, fmt.Errorf("failed fetching workload: %w", err)
 	}
 
+	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
+		req.ClusterName,
+		cl.GetClient(),
+		r.DownstreamCluster.GetClient(),
+		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
+	)
+	downstreamClient := downstreamStrategy.GetClient()
+
 	runtime := instance.Spec.Runtime
 	if runtime.Sandbox != nil {
 		return r.reconcileSandboxRuntimeInstance(
@@ -157,6 +165,8 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 			req.ClusterName,
 			gcpProject,
 			cl.GetClient(),
+			downstreamStrategy,
+			downstreamClient,
 			&workload,
 			&workloadDeployment,
 			&instance)
@@ -166,6 +176,8 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 			req.ClusterName,
 			gcpProject,
 			cl.GetClient(),
+			downstreamStrategy,
+			downstreamClient,
 			&workload,
 			&workloadDeployment,
 			&instance,
@@ -180,6 +192,8 @@ func (r *InstanceReconciler) reconcileInstance(
 	clusterName string,
 	gcpProject string,
 	upstreamClient client.Client,
+	downstreamStrategy downstreamclient.ResourceStrategy,
+	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
@@ -216,7 +230,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		}
 	}()
 
-	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, clusterName, gcpProject, upstreamClient, workload, workloadDeployment); err != nil {
+	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, clusterName, gcpProject, upstreamClient, downstreamClient, workload, workloadDeployment); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
 	}
 
@@ -230,7 +244,7 @@ func (r *InstanceReconciler) reconcileInstance(
 	serviceAccountObjectKey := client.ObjectKey{
 		Name: fmt.Sprintf("workload-%s", workload.UID),
 	}
-	if err := r.DownstreamCluster.GetClient().Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
+	if err := downstreamStrategy.GetClient().Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching workload's service account: %w", err)
 	}
 
@@ -275,7 +289,7 @@ func (r *InstanceReconciler) reconcileInstance(
 			},
 		}
 
-		if err := r.DownstreamCluster.GetClient().Create(ctx, &serviceAccount); err != nil {
+		if err := downstreamClient.Create(ctx, &serviceAccount); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create workload's service account: %w", err)
 		}
 	}
@@ -310,6 +324,8 @@ func (r *InstanceReconciler) reconcileInstance(
 		clusterName,
 		gcpProject,
 		upstreamClient,
+		downstreamStrategy,
+		downstreamClient,
 		&programmedCondition,
 		cloudConfig,
 		workload,
@@ -334,6 +350,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		ctx,
 		clusterName,
 		upstreamClient,
+		downstreamClient,
 		gcpProject,
 		gcpZone,
 		workload,
@@ -389,7 +406,9 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
 	gcpProject string,
-	client client.Client,
+	upstreamClient client.Client,
+	downstreamStrategy downstreamclient.ResourceStrategy,
+	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
@@ -531,8 +550,8 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 
 	serializer := k8sjson.NewSerializerWithOptions(
 		k8sjson.DefaultMetaFactory,
-		client.Scheme(),
-		client.Scheme(),
+		upstreamClient.Scheme(),
+		upstreamClient.Scheme(),
 		k8sjson.SerializerOptions{Yaml: true, Pretty: true},
 	)
 
@@ -575,7 +594,9 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 		ctx,
 		clusterName,
 		gcpProject,
-		client,
+		upstreamClient,
+		downstreamStrategy,
+		downstreamClient,
 		workload,
 		workloadDeployment,
 		instance,
@@ -588,7 +609,9 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
 	gcpProject string,
-	client client.Client,
+	upstreamClient client.Client,
+	downstreamStrategy downstreamclient.ResourceStrategy,
+	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
@@ -656,7 +679,9 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 		ctx,
 		clusterName,
 		gcpProject,
-		client,
+		upstreamClient,
+		downstreamStrategy,
+		downstreamClient,
 		workload,
 		workloadDeployment,
 		instance,
@@ -710,6 +735,8 @@ func (r *InstanceReconciler) reconcileSecrets(
 	clusterName string,
 	gcpProject string,
 	upstreamClient client.Client,
+	downstreamStrategy downstreamclient.ResourceStrategy,
+	downstreamClient client.Client,
 	programmedCondition *metav1.Condition,
 	cloudConfig *cloudinit.CloudConfig,
 	workload *computev1alpha.Workload,
@@ -749,9 +776,6 @@ func (r *InstanceReconciler) reconcileSecrets(
 		return false, fmt.Errorf("failed to marshal secret data")
 	}
 
-	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(clusterName, upstreamClient, r.DownstreamCluster.GetClient())
-	downstreamClient := downstreamStrategy.GetClient()
-
 	downstreamNamespaceName, err := downstreamStrategy.GetDownstreamNamespaceName(ctx, instance)
 	if err != nil {
 		return false, fmt.Errorf("failed to get downstream namespace name: %w", err)
@@ -788,7 +812,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	secretObjectKey := client.ObjectKey{
 		Name: fmt.Sprintf("workload-%s", workload.UID),
 	}
-	if err := r.DownstreamCluster.GetClient().Get(ctx, secretObjectKey, &secret); client.IgnoreNotFound(err) != nil {
+	if err := downstreamClient.Get(ctx, secretObjectKey, &secret); client.IgnoreNotFound(err) != nil {
 		return false, fmt.Errorf("failed fetching instance secret: %w", err)
 	}
 
@@ -824,7 +848,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 			},
 		}
 
-		if err := r.DownstreamCluster.GetClient().Create(ctx, &secret); err != nil {
+		if err := downstreamClient.Create(ctx, &secret); err != nil {
 			return false, fmt.Errorf("failed to create instance secret: %w", err)
 		}
 	}
@@ -845,8 +869,8 @@ func (r *InstanceReconciler) reconcileSecrets(
 		},
 	}
 
-	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), secretVersion, func() error {
-		if controllerutil.SetOwnerReference(&secret, secretVersion, r.DownstreamCluster.GetClient().Scheme()) != nil {
+	result, err := controllerutil.CreateOrPatch(ctx, downstreamClient, secretVersion, func() error {
+		if controllerutil.SetOwnerReference(&secret, secretVersion, downstreamClient.Scheme()) != nil {
 			return fmt.Errorf("failed to set owner reference on secret version: %w", err)
 		}
 
@@ -914,7 +938,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	)
 
 	var secretIAMMember gcpsecretmanagerv1beta2.SecretIAMMember
-	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKeyFromObject(&secret), &secretIAMMember); client.IgnoreNotFound(err) != nil {
+	if err := downstreamClient.Get(ctx, client.ObjectKeyFromObject(&secret), &secretIAMMember); client.IgnoreNotFound(err) != nil {
 		return false, fmt.Errorf("failed fetching secret's IAM policy: %w", err)
 	}
 
@@ -945,11 +969,11 @@ func (r *InstanceReconciler) reconcileSecrets(
 			},
 		}
 
-		if err := controllerutil.SetOwnerReference(&secret, &secretIAMMember, r.DownstreamCluster.GetClient().Scheme()); err != nil {
+		if err := controllerutil.SetOwnerReference(&secret, &secretIAMMember, downstreamClient.Scheme()); err != nil {
 			return false, fmt.Errorf("failed to set owner reference on secret IAM policy: %w", err)
 		}
 
-		if err := r.DownstreamCluster.GetClient().Create(ctx, &secretIAMMember); err != nil {
+		if err := downstreamClient.Create(ctx, &secretIAMMember); err != nil {
 			return false, fmt.Errorf("failed setting IAM policy on secret: %w", err)
 		}
 
@@ -977,6 +1001,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	ctx context.Context,
 	clusterName string,
 	upstreamClient client.Client,
+	downstreamClient client.Client,
 	gcpProject string,
 	gcpZone string,
 	workload *computev1alpha.Workload,
@@ -996,7 +1021,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 		},
 	}
 
-	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), gcpInstance, func() error {
+	result, err := controllerutil.CreateOrPatch(ctx, downstreamClient, gcpInstance, func() error {
 
 		if gcpInstance.Annotations == nil {
 			gcpInstance.Annotations = make(map[string]string)
@@ -1091,7 +1116,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 		logger.Info("instance is in STOPPING state, retrying create", "instance", gcpInstance.Name)
 		// Add an annotation to the GCP instance to have crossplane process it again.
 		gcpInstance.Annotations["compute.datumapis.com/infra-provider-gcp-retry-create"] = time.Now().Format(time.RFC3339)
-		if err := r.DownstreamCluster.GetClient().Update(ctx, gcpInstance); err != nil {
+		if err := downstreamClient.Update(ctx, gcpInstance); err != nil {
 			return nil, fmt.Errorf("failed to update instance with retry annotation: %w", err)
 		}
 		return nil, fmt.Errorf("instance created in STOPPING state, retrying create")
@@ -1306,6 +1331,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 	clusterName string,
 	gcpProject string,
 	upstreamClient client.Client,
+	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 ) error {
@@ -1358,7 +1384,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 				Name: firewallName,
 			}
 
-			if err := r.DownstreamCluster.GetClient().Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
+			if err := downstreamClient.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
 				return fmt.Errorf("failed to read firewall from k8s API: %w", err)
 			}
 
@@ -1440,7 +1466,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 					}
 				}
 
-				if err := r.DownstreamCluster.GetClient().Create(ctx, &firewall); err != nil {
+				if err := downstreamClient.Create(ctx, &firewall); err != nil {
 					return fmt.Errorf("failed to create firewall: %w", err)
 				}
 			}
@@ -1540,13 +1566,14 @@ func (r *InstanceReconciler) Finalize(
 	gcpInstanceObjectKey := client.ObjectKey{
 		Name: fmt.Sprintf("instance-%s", instance.UID),
 	}
+	downstreamClient := r.DownstreamCluster.GetClient()
 
-	if err := r.DownstreamCluster.GetClient().Get(ctx, gcpInstanceObjectKey, &gcpInstance); client.IgnoreNotFound(err) != nil {
+	if err := downstreamClient.Get(ctx, gcpInstanceObjectKey, &gcpInstance); client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("failed fetching downstream instance: %w", err)
 	}
 
 	if dt := gcpInstance.DeletionTimestamp; !gcpInstance.CreationTimestamp.IsZero() && dt.IsZero() {
-		if err := r.DownstreamCluster.GetClient().Delete(ctx, &gcpInstance); err != nil {
+		if err := downstreamClient.Delete(ctx, &gcpInstance); err != nil {
 			return fmt.Errorf("failed to delete downstream instance: %w", err)
 		}
 	}
@@ -1565,7 +1592,7 @@ func (r *InstanceReconciler) Finalize(
 	logger.Info("downstream instance deleted")
 
 	if controllerutil.RemoveFinalizer(&gcpInstance, gcpInfraFinalizer) {
-		if err := r.DownstreamCluster.GetClient().Update(ctx, &gcpInstance); err != nil {
+		if err := downstreamClient.Update(ctx, &gcpInstance); err != nil {
 			return fmt.Errorf("failed to remove finalizer: %w", err)
 		}
 	}

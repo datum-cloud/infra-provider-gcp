@@ -236,6 +236,11 @@ type DownstreamResourceManagementConfig struct {
 	// ProviderConfigStrategy is the strategy to use to identify the ProviderConfig
 	// to use when managing downstream resources.
 	ProviderConfigStrategy ProviderConfigStrategy `json:"providerConfigStrategy"`
+
+	// ManagedResourceLabels is a set of labels to apply to all resources managed
+	// by the operator. These labels will be used to filter downstream resources
+	// such as Crossplane types and anchor entities.
+	ManagedResourceLabels map[string]string `json:"managedResourceLabels,omitempty"`
 }
 
 // +k8s:deepcopy-gen=true

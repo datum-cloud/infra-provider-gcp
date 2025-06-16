@@ -103,6 +103,14 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		return ctrl.Result{}, fmt.Errorf("failed fetching network: %w", err)
 	}
 
+	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
+		req.ClusterName,
+		cl.GetClient(),
+		r.DownstreamCluster.GetClient(),
+		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
+	)
+	downstreamClient := downstreamStrategy.GetClient()
+
 	// Note!!!
 	//
 	// Crossplane v1 managed resources are cluster scoped! We don't want
@@ -123,7 +131,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		},
 	}
 
-	result, err := controllerutil.CreateOrPatch(ctx, r.DownstreamCluster.GetClient(), downstreamNetwork, func() error {
+	result, err := controllerutil.CreateOrPatch(ctx, downstreamClient, downstreamNetwork, func() error {
 		if downstreamNetwork.Annotations == nil {
 			downstreamNetwork.Annotations = make(map[string]string)
 		}

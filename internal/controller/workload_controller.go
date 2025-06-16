@@ -9,6 +9,7 @@ import (
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -24,6 +25,8 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
+
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
@@ -37,6 +40,7 @@ type WorkloadReconciler struct {
 	mgr               mcmanager.Manager
 	DownstreamCluster cluster.Cluster
 	LocationClassName string
+	Config            *config.GCPProvider
 }
 
 func (r *WorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (_ ctrl.Result, err error) {
@@ -62,7 +66,12 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 
 	if !workload.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&workload, gcpInfraFinalizer) {
-			downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(req.ClusterName, cl.GetClient(), r.DownstreamCluster.GetClient())
+			downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
+				req.ClusterName,
+				cl.GetClient(),
+				r.DownstreamCluster.GetClient(),
+				r.Config.DownstreamResourceManagement.ManagedResourceLabels,
+			)
 
 			if err := downstreamStrategy.DeleteAnchorForObject(ctx, &workload); err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to delete anchor for workload: %w", err)

@@ -126,13 +126,21 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to get network: %w", err)
 	}
 
+	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
+		req.ClusterName,
+		cl.GetClient(),
+		r.DownstreamCluster.GetClient(),
+		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
+	)
+	downstreamClient := downstreamStrategy.GetClient()
+
 	downstreamSubnet := &gcpcomputev1beta2.Subnetwork{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("subnet-%s", subnet.UID),
 		},
 	}
 
-	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKey{Name: downstreamSubnet.Name}, downstreamSubnet); client.IgnoreNotFound(err) != nil {
+	if err := downstreamClient.Get(ctx, client.ObjectKey{Name: downstreamSubnet.Name}, downstreamSubnet); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get downstream subnet: %w", err)
 	}
 
@@ -165,7 +173,7 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 			},
 		}
 
-		if err := r.DownstreamCluster.GetClient().Create(ctx, downstreamSubnet); err != nil {
+		if err := downstreamClient.Create(ctx, downstreamSubnet); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create downstream subnet: %w", err)
 		}
 	}

@@ -3,6 +3,7 @@ package downstreamclient
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,27 +22,31 @@ import (
 var _ ResourceStrategy = &mappedNamespaceResourceStrategy{}
 
 type mappedNamespaceResourceStrategy struct {
-	upstreamClusterName string
-	upstreamClient      client.Client
-	downstreamClient    client.Client
+	upstreamClusterName   string
+	upstreamClient        client.Client
+	downstreamClient      client.Client
+	managedResourceLabels map[string]string
 }
 
 func NewMappedNamespaceResourceStrategy(
 	upstreamClusterName string,
 	upstreamClient client.Client,
 	downstreamClient client.Client,
+	managedResourceLabels map[string]string,
 ) ResourceStrategy {
 	return &mappedNamespaceResourceStrategy{
-		upstreamClusterName: upstreamClusterName,
-		upstreamClient:      upstreamClient,
-		downstreamClient:    downstreamClient,
+		upstreamClusterName:   upstreamClusterName,
+		upstreamClient:        upstreamClient,
+		downstreamClient:      downstreamClient,
+		managedResourceLabels: managedResourceLabels,
 	}
 }
 
 func (c *mappedNamespaceResourceStrategy) GetClient() client.Client {
 	return &mappedNamespaceClient{
-		client:           c.downstreamClient,
-		resourceStrategy: c,
+		client:                c.downstreamClient,
+		resourceStrategy:      c,
+		managedResourceLabels: c.managedResourceLabels,
 	}
 }
 
@@ -83,6 +88,10 @@ func (c *mappedNamespaceResourceStrategy) GetDownstreamNamespaceName(ctx context
 }
 
 func (c *mappedNamespaceResourceStrategy) ensureDownstreamNamespace(ctx context.Context, obj metav1.Object) (*corev1.Namespace, error) {
+	if obj.GetNamespace() == "" {
+		return nil, nil
+	}
+
 	downstreamNamespace := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: obj.GetNamespace(),
@@ -207,8 +216,9 @@ func (c *mappedNamespaceResourceStrategy) DeleteAnchorForObject(
 var _ client.Client = &mappedNamespaceClient{}
 
 type mappedNamespaceClient struct {
-	client           client.Client
-	resourceStrategy *mappedNamespaceResourceStrategy
+	client                client.Client
+	resourceStrategy      *mappedNamespaceResourceStrategy
+	managedResourceLabels map[string]string
 }
 
 func (c *mappedNamespaceClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
@@ -216,6 +226,15 @@ func (c *mappedNamespaceClient) Create(ctx context.Context, obj client.Object, o
 	if err != nil {
 		return fmt.Errorf("failed to ensure downstream namespace: %w", err)
 	}
+
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	maps.Copy(labels, c.managedResourceLabels)
+
+	obj.SetLabels(labels)
 
 	return c.client.Create(ctx, obj, opts...)
 }

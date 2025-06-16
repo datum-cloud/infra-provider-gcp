@@ -20,11 +20,13 @@ import (
 	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
 	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
 	gcpv1beta1 "github.com/upbound/provider-gcp/apis/v1beta1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -172,6 +174,9 @@ func main() {
 
 	downstreamCluster, err := cluster.New(downstreamRestConfig, func(o *cluster.Options) {
 		o.Scheme = scheme
+		o.Cache = cache.Options{
+			DefaultLabelSelector: labels.SelectorFromSet(serverConfig.DownstreamResourceManagement.ManagedResourceLabels),
+		}
 	})
 	if err != nil {
 		setupLog.Error(err, "failed to construct cluster")
@@ -181,6 +186,7 @@ func main() {
 	if err = (&controller.WorkloadReconciler{
 		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
+		Config:            &serverConfig,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
 		os.Exit(1)
