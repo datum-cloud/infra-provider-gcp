@@ -99,11 +99,13 @@ func (c *mappedNamespaceResourceStrategy) ensureDownstreamNamespace(ctx context.
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, c.downstreamClient, downstreamNamespace, func() error {
-		if downstreamNamespace.Labels == nil {
-			downstreamNamespace.Labels = make(map[string]string)
-		}
+		metav1.SetMetaDataLabel(
+			&downstreamNamespace.ObjectMeta,
+			UpstreamOwnerClusterName,
+			fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_")),
+		)
 
-		downstreamNamespace.Labels[UpstreamOwnerClusterName] = fmt.Sprintf("cluster-%s", strings.ReplaceAll(c.upstreamClusterName, "/", "_"))
+		maps.Copy(downstreamNamespace.ObjectMeta.Labels, c.managedResourceLabels)
 
 		return nil
 	})
