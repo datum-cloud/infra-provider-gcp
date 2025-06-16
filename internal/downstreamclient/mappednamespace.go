@@ -159,6 +159,7 @@ func (c *mappedNamespaceResourceStrategy) SetControllerReference(ctx context.Con
 	if anchorConfigMap.CreationTimestamp.IsZero() {
 		anchorConfigMap.Name = anchorName
 		anchorConfigMap.Annotations = anchorAnnotations
+		anchorConfigMap.Labels = maps.Clone(c.managedResourceLabels)
 		anchorConfigMap.Namespace = controlled.GetNamespace()
 		if err := downstreamClient.Create(ctx, &anchorConfigMap); err != nil {
 			return fmt.Errorf("failed creating anchor configmap: %w", err)
