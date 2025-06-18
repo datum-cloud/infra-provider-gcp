@@ -3,30 +3,44 @@
 package main
 
 import (
-	"crypto/tls"
+	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"golang.org/x/sync/errgroup"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
-	"k8s.io/client-go/tools/clientcmd"
 
-	kcccomputev1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/compute/v1beta1"
-	kcciamv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/iam/v1beta1"
-	kccsecretmanagerv1beta1 "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/clients/generated/apis/secretmanager/v1beta1"
+	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
+	gcpcomputev1beta1 "github.com/upbound/provider-gcp/apis/compute/v1beta1"
+	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
+	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
+	gcpsecretmanagerv1beta2 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta2"
+	gcpv1beta1 "github.com/upbound/provider-gcp/apis/v1beta1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
+	mcsingle "sigs.k8s.io/multicluster-runtime/providers/single"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller"
+	"go.datum.net/infra-provider-gcp/internal/providers"
+	mcdatum "go.datum.net/infra-provider-gcp/internal/providers/datum"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 	// +kubebuilder:scaffold:imports
@@ -35,6 +49,7 @@ import (
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+	codecs   = serializer.NewCodecFactory(scheme, serializer.EnableStrict)
 )
 
 func init() {
@@ -42,128 +57,90 @@ func init() {
 	utilruntime.Must(computev1alpha.AddToScheme(scheme))
 	utilruntime.Must(networkingv1alpha.AddToScheme(scheme))
 
-	utilruntime.Must(kcccomputev1beta1.AddToScheme(scheme))
-	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
-	utilruntime.Must(kcciamv1beta1.AddToScheme(scheme))
-	utilruntime.Must(kccsecretmanagerv1beta1.AddToScheme(scheme))
+	utilruntime.Must(config.AddToScheme(scheme))
+	utilruntime.Must(config.RegisterDefaults(scheme))
+
+	utilruntime.Must(gcpv1beta1.SchemeBuilder.AddToScheme(scheme))
+	utilruntime.Must(gcpcomputev1beta1.AddToScheme(scheme))
+	utilruntime.Must(gcpcomputev1beta2.AddToScheme(scheme))
+	utilruntime.Must(gcpcloudplatformv1beta1.AddToScheme(scheme))
+	utilruntime.Must(gcpsecretmanagerv1beta1.AddToScheme(scheme))
+	utilruntime.Must(gcpsecretmanagerv1beta2.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
 
 func main() {
-	var metricsAddr string
 	var enableLeaderElection bool
 	var leaderElectionNamespace string
 	var probeAddr string
-	var secureMetrics bool
-	var enableHTTP2 bool
-	var tlsOpts []func(*tls.Config)
-	var upstreamKubeconfig string
-	var locationClassName string
-	var infraNamespace string
+	var serverConfigFile string
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
-		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.StringVar(&leaderElectionNamespace, "leader-elect-namespace", "", "The namespace to use for leader election.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", true,
-		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-
-	// TODO(jreese) move to an approach that leverages a CRD to configure which
-	// locations this deployment of infra-provider-gcp will consider. Should
-	// include things like label or field selectors, anti-affinities for resources,
-	// etc. When this is done, we should investigate leveraging the `ByObject`
-	// setting of the informer cache to prevent populating the cache with entities
-	// which the operator does not need to receive. We'll likely need to lean
-	// into well known labels here, since a location class is defined on a location,
-	// which entities only reference and do not embed.
-	flag.StringVar(
-		&locationClassName,
-		"location-class",
-		"self-managed",
-		"Only consider resources attached to locations with the  specified location class.",
-	)
 
 	opts := zap.Options{
 		Development: true,
 	}
+
+	flag.StringVar(&serverConfigFile, "server-config", "", "path to the server config file")
+
 	opts.BindFlags(flag.CommandLine)
-
-	flag.StringVar(&upstreamKubeconfig, "upstream-kubeconfig", "", "absolute path to the kubeconfig "+
-		"file for the API server that is the source of truth for datum entities")
-
-	flag.StringVar(&infraNamespace, "infra-namespace", "", "The namespace which resources for managing GCP entities "+
-		"should be created in.")
 
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
+	var serverConfig config.GCPProvider
+	var configData []byte
+	if len(serverConfigFile) > 0 {
+		var err error
+		configData, err = os.ReadFile(serverConfigFile)
+		if err != nil {
+			setupLog.Error(fmt.Errorf("unable to read server config from %q", serverConfigFile), "")
+			os.Exit(1)
+		}
 	}
 
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
+	if err := runtime.DecodeInto(codecs.UniversalDecoder(), configData, &serverConfig); err != nil {
+		setupLog.Error(err, "unable to decode server config")
+		os.Exit(1)
 	}
 
-	webhookServer := webhook.NewServer(webhook.Options{
-		TLSOpts: tlsOpts,
+	setupLog.Info("server config", "config", serverConfig)
+
+	cfg := ctrl.GetConfigOrDie()
+
+	deploymentCluster, err := cluster.New(cfg, func(o *cluster.Options) {
+		o.Scheme = scheme
 	})
-
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-	// More info:
-	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/metrics/server
-	// - https://book.kubebuilder.io/reference/metrics.html
-	metricsServerOptions := metricsserver.Options{
-		BindAddress:   metricsAddr,
-		SecureServing: secureMetrics,
-		// TODO(user): TLSOpts is used to allow configuring the TLS config used for the server. If certificates are
-		// not provided, self-signed certificates will be generated by default. This option is not recommended for
-		// production environments as self-signed certificates do not offer the same level of trust and security
-		// as certificates issued by a trusted Certificate Authority (CA). The primary risk is potentially allowing
-		// unauthorized access to sensitive metrics data. Consider replacing with CertDir, CertName, and KeyName
-		// to provide certificates, ensuring the server communicates using trusted and secure certificates.
-		TLSOpts: tlsOpts,
-	}
-
-	if secureMetrics {
-		// FilterProvider is used to protect the metrics endpoint with authn/authz.
-		// These configurations ensure that only authorized users and service accounts
-		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
-		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/metrics/filters#WithAuthenticationAndAuthorization
-		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
-	}
-
-	if len(upstreamKubeconfig) == 0 {
-		setupLog.Info("must provide --upstream-kubeconfig")
-		os.Exit(1)
-	}
-
-	if len(infraNamespace) == 0 {
-		setupLog.Info("must provide --infra-namespace")
-		os.Exit(1)
-	}
-
-	upstreamClusterConfig, err := clientcmd.BuildConfigFromFlags("", upstreamKubeconfig)
 	if err != nil {
-		setupLog.Error(err, "unable to load control plane kubeconfig")
+		setupLog.Error(err, "failed creating local cluster")
 		os.Exit(1)
 	}
 
-	mgr, err := ctrl.NewManager(upstreamClusterConfig, ctrl.Options{
+	runnables, provider, err := initializeClusterDiscovery(serverConfig, deploymentCluster, scheme)
+	if err != nil {
+		setupLog.Error(err, "unable to initialize cluster discovery")
+		os.Exit(1)
+	}
+
+	setupLog.Info("cluster discovery mode", "mode", serverConfig.Discovery.Mode)
+
+	ctx := ctrl.SetupSignalHandler()
+
+	deploymentClusterClient := deploymentCluster.GetClient()
+
+	metricsServerOptions := serverConfig.MetricsServer.Options(ctx, deploymentClusterClient)
+
+	webhookServer := webhook.NewServer(
+		serverConfig.WebhookServer.Options(ctx, deploymentClusterClient),
+	)
+
+	mgr, err := mcmanager.New(cfg, provider, ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsServerOptions,
 		WebhookServer:           webhookServer,
@@ -189,68 +166,73 @@ func main() {
 		os.Exit(1)
 	}
 
-	// We consider the cluster that the operator has been deployed in to be the
-	// target cluster for infrastructure components.
-	infraCluster, err := cluster.New(ctrl.GetConfigOrDie(), func(o *cluster.Options) {
+	downstreamRestConfig, err := serverConfig.DownstreamResourceManagement.RestConfig()
+	if err != nil {
+		setupLog.Error(err, "unable to load control plane kubeconfig")
+		os.Exit(1)
+	}
+
+	downstreamCluster, err := cluster.New(downstreamRestConfig, func(o *cluster.Options) {
 		o.Scheme = scheme
+		o.Cache = cache.Options{
+			DefaultLabelSelector: labels.SelectorFromSet(serverConfig.DownstreamResourceManagement.ManagedResourceLabels),
+		}
 	})
 	if err != nil {
 		setupLog.Error(err, "failed to construct cluster")
 		os.Exit(1)
 	}
 
-	if err := mgr.Add(infraCluster); err != nil {
-		setupLog.Error(err, "failed to add cluster to manager")
+	if err = (&controller.WorkloadReconciler{
+		LocationClassName: serverConfig.LocationClassName,
+		DownstreamCluster: downstreamCluster,
+		Config:            &serverConfig,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
 		os.Exit(1)
 	}
 
-	// TODO(jreese) rework the gateway controller when we have a higher level
-	// orchestrator from network-services-operator that schedules "sub gateways"
-	// onto clusters, similar to Workloads -> WorkloadDeployments and
-	// Networks -> NetworkContexts
-	//
-	// if err = (&controller.WorkloadGatewayReconciler{
-	// 	Client:      mgr.GetClient(),
-	// 	InfraClient: infraCluster.GetClient(),
-	// 	Scheme:      mgr.GetScheme(),
-	// 	GCPProject:  gcpProject,
-	// }).SetupWithManager(mgr, infraCluster); err != nil {
-	// 	setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
-	// 	os.Exit(1)
-	// }
-
-	if err = (&controller.WorkloadDeploymentReconciler{
-		Client:                    mgr.GetClient(),
-		InfraClient:               infraCluster.GetClient(),
-		Scheme:                    mgr.GetScheme(),
-		LocationClassName:         locationClassName,
-		InfraClusterNamespaceName: infraNamespace,
-	}).SetupWithManager(mgr, infraCluster); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
+	if err = (&controller.InstanceReconciler{
+		Config:            serverConfig,
+		LocationClassName: serverConfig.LocationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "InstanceReconciler")
 		os.Exit(1)
 	}
 
-	if err = (&controller.InstanceDiscoveryReconciler{
-		Client:      mgr.GetClient(),
-		InfraClient: infraCluster.GetClient(),
-		Scheme:      mgr.GetScheme(),
-	}).SetupWithManager(mgr, infraCluster); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "InstanceDiscoveryReconciler")
+	if err = (&controller.NetworkReconciler{
+		LocationClassName: serverConfig.LocationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NetworkReconciler")
 		os.Exit(1)
 	}
 
 	if err = (&controller.NetworkContextReconciler{
-		Client:                    mgr.GetClient(),
-		InfraClient:               infraCluster.GetClient(),
-		Scheme:                    mgr.GetScheme(),
-		LocationClassName:         locationClassName,
-		InfraClusterNamespaceName: infraNamespace,
-	}).SetupWithManager(mgr, infraCluster); err != nil {
+		Config:            serverConfig,
+		LocationClassName: serverConfig.LocationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NetworkContextReconciler")
 		os.Exit(1)
 	}
 
+	if err = (&controller.SubnetReconciler{
+		Config:            serverConfig,
+		LocationClassName: serverConfig.LocationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SubnetReconciler")
+		os.Exit(1)
+	}
+
 	// +kubebuilder:scaffold:builder
+
+	if err = controller.AddIndexers(ctx, mgr); err != nil {
+		setupLog.Error(err, "unable to add indexers")
+		os.Exit(1)
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
@@ -261,9 +243,126 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+	g, ctx := errgroup.WithContext(ctx)
+	for _, runnable := range runnables {
+		g.Go(func() error {
+			return ignoreCanceled(runnable.Start(ctx))
+		})
+	}
+
+	setupLog.Info("starting cluster discovery provider")
+	g.Go(func() error {
+		return ignoreCanceled(provider.Run(ctx, mgr))
+	})
+
+	g.Go(func() error {
+		return ignoreCanceled(downstreamCluster.Start(ctx))
+	})
+
+	setupLog.Info("starting multicluster manager")
+	g.Go(func() error {
+		return ignoreCanceled(mgr.Start(ctx))
+	})
+
+	if err := g.Wait(); err != nil {
+		setupLog.Error(err, "unable to start")
 		os.Exit(1)
 	}
+}
+
+type runnableProvider interface {
+	multicluster.Provider
+	Run(context.Context, mcmanager.Manager) error
+}
+
+// Needed until we contribute the patch in the following PR again (need to sign CLA):
+//
+//	See: https://github.com/kubernetes-sigs/multicluster-runtime/pull/18
+type wrappedSingleClusterProvider struct {
+	multicluster.Provider
+	cluster cluster.Cluster
+}
+
+func (p *wrappedSingleClusterProvider) Run(ctx context.Context, mgr mcmanager.Manager) error {
+	if err := mgr.Engage(ctx, "single", p.cluster); err != nil {
+		return err
+	}
+	return p.Provider.(runnableProvider).Run(ctx, mgr)
+}
+
+func initializeClusterDiscovery(
+	serverConfig config.GCPProvider,
+	deploymentCluster cluster.Cluster,
+	scheme *runtime.Scheme,
+) (runnables []manager.Runnable, provider runnableProvider, err error) {
+	runnables = append(runnables, deploymentCluster)
+	switch serverConfig.Discovery.Mode {
+	case providers.ProviderSingle:
+		provider = &wrappedSingleClusterProvider{
+			Provider: mcsingle.New("single", deploymentCluster),
+			cluster:  deploymentCluster,
+		}
+
+	case providers.ProviderDatum:
+		discoveryRestConfig, err := serverConfig.Discovery.DiscoveryRestConfig()
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to get discovery rest config: %w", err)
+		}
+
+		projectRestConfig, err := serverConfig.Discovery.ProjectRestConfig()
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to get project rest config: %w", err)
+		}
+
+		discoveryManager, err := manager.New(discoveryRestConfig, manager.Options{
+			Client: client.Options{
+				Cache: &client.CacheOptions{
+					Unstructured: true,
+				},
+			},
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to set up overall controller manager: %w", err)
+		}
+
+		provider, err = mcdatum.New(discoveryManager, mcdatum.Options{
+			ClusterOptions: []cluster.Option{
+				func(o *cluster.Options) {
+					o.Scheme = scheme
+				},
+			},
+			InternalServiceDiscovery: serverConfig.Discovery.InternalServiceDiscovery,
+			ProjectRestConfig:        projectRestConfig,
+			LabelSelector:            serverConfig.Discovery.LabelSelector,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to create datum project provider: %w", err)
+		}
+
+		runnables = append(runnables, discoveryManager)
+
+	// case providers.ProviderKind:
+	// 	provider = mckind.New(mckind.Options{
+	// 		ClusterOptions: []cluster.Option{
+	// 			func(o *cluster.Options) {
+	// 				o.Scheme = scheme
+	// 			},
+	// 		},
+	// 	})
+
+	default:
+		return nil, nil, fmt.Errorf(
+			"unsupported cluster discovery mode %s",
+			serverConfig.Discovery.Mode,
+		)
+	}
+
+	return runnables, provider, nil
+}
+
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }

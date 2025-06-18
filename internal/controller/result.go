@@ -16,7 +16,7 @@ type Result struct {
 }
 
 func (r Result) ShouldReturn() bool {
-	return r.Err != nil || !r.Result.IsZero() || r.StopProcessing
+	return r.Err != nil || !r.IsZero() || r.StopProcessing
 }
 
 func (r Result) Get() (ctrl.Result, error) {
