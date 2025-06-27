@@ -15,6 +15,9 @@ import (
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	crossplanemeta "github.com/crossplane/crossplane-runtime/pkg/meta"
+	awsec2v1beta1 "github.com/upbound/provider-aws/apis/ec2/v1beta1"
+	awsiamv1beta1 "github.com/upbound/provider-aws/apis/iam/v1beta1"
+	awsssmv1beta1 "github.com/upbound/provider-aws/apis/ssm/v1beta1"
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
@@ -46,6 +49,7 @@ import (
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	datumsource "go.datum.net/infra-provider-gcp/internal/source"
+	"go.datum.net/infra-provider-gcp/internal/util/text"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -55,7 +59,10 @@ const crossplaneFinalizer = "finalizer.managedresource.crossplane.io"
 var errResourceIsDeleting = errors.New("resource is deleting")
 
 //go:embed cloudinit/populate_secrets.py
-var populateSecretsScript string
+var gcpPopulateSecretsScript string
+
+//go:embed cloudinit/populate_secrets_from_ssm.sh
+var awsPopulateSecretsScript string
 
 // InstanceReconciler reconciles Instances and manages their intended state in
 // GCP
@@ -95,8 +102,6 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	} else if !shouldProcess {
 		return ctrl.Result{}, nil
 	}
-
-	gcpProject := location.Spec.Provider.GCP.ProjectID
 
 	logger.Info("reconciling instance")
 	defer logger.Info("reconcile complete")
@@ -163,7 +168,7 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return r.reconcileSandboxRuntimeInstance(
 			ctx,
 			req.ClusterName,
-			gcpProject,
+			*location,
 			cl.GetClient(),
 			downstreamStrategy,
 			downstreamClient,
@@ -174,7 +179,7 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return r.reconcileVMRuntimeInstance(
 			ctx,
 			req.ClusterName,
-			gcpProject,
+			*location,
 			cl.GetClient(),
 			downstreamStrategy,
 			downstreamClient,
@@ -187,10 +192,12 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	return ctrl.Result{}, nil
 }
 
+// TODO(jreese) Audit for workload-scoped but regional resources, make sure
+// the k8s entity names are unique across regions.
 func (r *InstanceReconciler) reconcileInstance(
 	ctx context.Context,
 	clusterName string,
-	gcpProject string,
+	location networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
@@ -201,20 +208,6 @@ func (r *InstanceReconciler) reconcileInstance(
 	instanceMetadata map[string]*string,
 ) (res ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
-	var location networkingv1alpha.Location
-	locationObjectKey := client.ObjectKey{
-		Namespace: instance.Spec.Location.Namespace,
-		Name:      instance.Spec.Location.Name,
-	}
-	if err := upstreamClient.Get(ctx, locationObjectKey, &location); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed fetching location: %w", err)
-	}
-
-	if location.Spec.Provider.GCP == nil {
-		return ctrl.Result{}, fmt.Errorf("attached location is not for the GCP provider")
-	}
-
-	gcpZone := location.Spec.Provider.GCP.Zone
 
 	programmedCondition := metav1.Condition{
 		Type:               computev1alpha.InstanceProgrammed,
@@ -230,173 +223,446 @@ func (r *InstanceReconciler) reconcileInstance(
 		}
 	}()
 
-	if err := r.reconcileNetworkInterfaceNetworkPolicies(ctx, clusterName, gcpProject, upstreamClient, downstreamClient, workload, workloadDeployment); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed reconciling network interface network policies: %w", err)
+	if err := r.reconcileNetworkInterfaces(
+		ctx,
+		clusterName,
+		location,
+		upstreamClient,
+		downstreamClient,
+		workload,
+		workloadDeployment,
+		instance,
+	); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed reconciling network interfaces: %w", err)
 	}
-
-	// Service account names cannot exceed 30 characters
-	// TODO(jreese) move to base36, as the underlying bytes won't be lost
-	h := fnv.New32a()
-	h.Write([]byte(workload.UID))
-
-	// NOTE: This is garbage collected in the workload controller.
-	var serviceAccount gcpcloudplatformv1beta1.ServiceAccount
-	serviceAccountObjectKey := client.ObjectKey{
-		Name: fmt.Sprintf("workload-%s", workload.UID),
-	}
-	if err := downstreamStrategy.GetClient().Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
-		return ctrl.Result{}, fmt.Errorf("failed fetching workload's service account: %w", err)
-	}
-
-	// NOTE: We do not wait for the service account to be ready, as the underlying
-	// Terraform provider has a `time.Sleep(10 * time.Second)` in the create path.
-	// See: https://github.com/hashicorp/terraform-provider-google/blob/092c36f3857a8ca0291dd3992f72357cabd45dc7/google/services/resourcemanager/resource_google_service_account.go#L181-L184
-	//
-	// In testing, the service account is created and ready in less than a second.
-	// In the case that it's not ready, the system will retry until it is.
-	//
-	// We do, however, wait for the Crossplane `AnnotationKeyExternalCreateSucceeded`
-	// annotation to show up, to ensure the action has been issued prior to trying
-	// to create the instance.
-	if serviceAccount.CreationTimestamp.IsZero() {
-		serviceAccount = gcpcloudplatformv1beta1.ServiceAccount{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: serviceAccountObjectKey.Name,
-				Annotations: map[string]string{
-					downstreamclient.UpstreamOwnerName:        workload.Name,
-					downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-					downstreamclient.UpstreamOwnerClusterName: clusterName,
-					crossplanemeta.AnnotationKeyExternalName:  fmt.Sprintf("workload-%d", h.Sum32()),
-				},
-				Labels: map[string]string{
-					computev1alpha.WorkloadUIDLabel: string(workload.UID),
-				},
-			},
-			Spec: gcpcloudplatformv1beta1.ServiceAccountSpec{
-				ResourceSpec: crossplanecommonv1.ResourceSpec{
-					ManagementPolicies: crossplanecommonv1.ManagementPolicies{
-						crossplanecommonv1.ManagementActionAll,
-					},
-					DeletionPolicy: crossplanecommonv1.DeletionDelete,
-					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: r.Config.GetProviderConfigName(clusterName),
-					},
-				},
-				ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
-					Project:     ptr.To(gcpProject),
-					Description: ptr.To(fmt.Sprintf("service account for workload %s", workload.UID)),
-				},
-			},
-		}
-
-		if err := downstreamClient.Create(ctx, &serviceAccount); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to create workload's service account: %w", err)
-		}
-	}
-
-	// TODO(jreese) use "Observe" mode resources to check on service account
-	// status. I've ran into a condition in testing where the service account
-	// was not found by the instance, which resulted in the create operation
-	// being rejected.
-
-	// See if there's been a failure to create the service account.
-	if condition := serviceAccount.Status.GetCondition("LastAsyncOperation"); condition.Reason == "AsyncCreateFailure" {
-		logger.Info("service account failed to create")
-		programmedCondition.Reason = "ServiceAccountFailedToCreate"
-		// TODO(jreese) should we only pass this through for locations in the same
-		// datum project (cluster for multicluster-runtime) as the instance?
-		programmedCondition.Message = fmt.Sprintf("Service account failed to create: %s", condition.Message)
-		return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
-	}
-
-	// TODO(jreese) add IAM Policy to the GCP service account to allow the service
-	// account used by Crossplane the `roles/iam.serviceAccountUser` role,
-	// so that it can create instances with the service account without needing a
-	// project level role binding. Probably just pass in the service account
-	// email, otherwise we'd have to do some kind of discovery.
 
 	if err := r.buildConfigMaps(ctx, upstreamClient, cloudConfig, instance); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
 	}
 
-	proceed, err := r.reconcileSecrets(
-		ctx,
-		clusterName,
-		gcpProject,
-		upstreamClient,
-		downstreamStrategy,
-		downstreamClient,
-		&programmedCondition,
-		cloudConfig,
-		workload,
-		instance,
-		serviceAccount,
-	)
-	if !proceed || err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// It's unlikely that we will hit this condition, as we wait for secrets
-	// above to be ready and return early if they are not. However, it's good to
-	// check.
-	if _, ok := serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalCreateSucceeded]; !ok {
-		logger.Info("service account not created yet", "service_account", serviceAccount.Name)
-		programmedCondition.Reason = "ProvisioningServiceAccount"
-		programmedCondition.Message = "Service account is being provisioned for the workload"
-		return ctrl.Result{}, nil
-	}
-
-	gcpInstance, err := r.reconcileGCPInstance(
-		ctx,
-		clusterName,
-		upstreamClient,
-		downstreamClient,
-		gcpProject,
-		gcpZone,
-		workload,
-		workloadDeployment,
-		instance,
-		cloudConfig,
-		instanceMetadata,
-		serviceAccount,
-	)
+	aggregatedK8sSecret, hasAggregatedSecret, err := r.reconcileAggregatedSecret(ctx, upstreamClient, downstreamStrategy, downstreamClient, instance, workload)
 	if err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("failed reconciling aggregated secret: %w", err)
 	}
 
-	if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("GCP instance not ready yet")
-		programmedCondition.Reason = "ProvisioningProviderInstance"
-		programmedCondition.Message = "GCP instance is being provisioned"
+	if location.Spec.Provider.GCP != nil {
+		// Service account names cannot exceed 30 characters
+		// TODO(jreese) move to base36, as the underlying bytes won't be lost
+		h := fnv.New32a()
+		h.Write([]byte(workload.UID))
 
-		return ctrl.Result{}, nil
-	}
-
-	programmedCondition.Status = metav1.ConditionTrue
-	programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
-	programmedCondition.Message = "Instance has been programmed"
-	instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
-		ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
-	}
-
-	// TODO(jreese) remove when we have workload-operator define these
-	if len(instance.Status.NetworkInterfaces) == 0 {
-		instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(gcpInstance.Status.AtProvider.NetworkInterface))
-	}
-
-	for i, gcpNetworkInterface := range gcpInstance.Status.AtProvider.NetworkInterface {
-		interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
-		if gcpNetworkInterface.NetworkIP != nil {
-			interfaceStatus.Assignments.NetworkIP = gcpNetworkInterface.NetworkIP
+		// NOTE: This is garbage collected in the workload controller.
+		var serviceAccount gcpcloudplatformv1beta1.ServiceAccount
+		serviceAccountObjectKey := client.ObjectKey{
+			Name: fmt.Sprintf("workload-%s", workload.UID),
+		}
+		if err := downstreamStrategy.GetClient().Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching workload's service account: %w", err)
 		}
 
-		for _, accessConfig := range gcpNetworkInterface.AccessConfig {
-			if accessConfig.NATIP != nil {
-				interfaceStatus.Assignments.ExternalIP = accessConfig.NATIP
+		// NOTE: We do not wait for the service account to be ready, as the underlying
+		// Terraform provider has a `time.Sleep(10 * time.Second)` in the create path.
+		// See: https://github.com/hashicorp/terraform-provider-google/blob/092c36f3857a8ca0291dd3992f72357cabd45dc7/google/services/resourcemanager/resource_google_service_account.go#L181-L184
+		//
+		// In testing, the service account is created and ready in less than a second.
+		// In the case that it's not ready, the system will retry until it is.
+		//
+		// We do, however, wait for the Crossplane `AnnotationKeyExternalCreateSucceeded`
+		// annotation to show up, to ensure the action has been issued prior to trying
+		// to create the instance.
+		if serviceAccount.CreationTimestamp.IsZero() {
+			serviceAccount = gcpcloudplatformv1beta1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: serviceAccountObjectKey.Name,
+					Annotations: map[string]string{
+						downstreamclient.UpstreamOwnerName:        workload.Name,
+						downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+						downstreamclient.UpstreamOwnerClusterName: clusterName,
+						crossplanemeta.AnnotationKeyExternalName:  fmt.Sprintf("workload-%d", h.Sum32()),
+					},
+					Labels: map[string]string{
+						computev1alpha.WorkloadUIDLabel: string(workload.UID),
+					},
+				},
+				Spec: gcpcloudplatformv1beta1.ServiceAccountSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+							crossplanecommonv1.ManagementActionAll,
+						},
+						DeletionPolicy: crossplanecommonv1.DeletionDelete,
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("GCP", clusterName),
+						},
+					},
+					ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
+						Project:     ptr.To(location.Spec.Provider.GCP.ProjectID),
+						Description: ptr.To(fmt.Sprintf("service account for workload %s", workload.UID)),
+					},
+				},
+			}
+
+			if err := downstreamClient.Create(ctx, &serviceAccount); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create workload's service account: %w", err)
 			}
 		}
 
-		instance.Status.NetworkInterfaces[i] = interfaceStatus
+		// TODO(jreese) use "Observe" mode resources to check on service account
+		// status. I've ran into a condition in testing where the service account
+		// was not found by the instance, which resulted in the create operation
+		// being rejected.
+
+		// See if there's been a failure to create the service account.
+		if condition := serviceAccount.Status.GetCondition("LastAsyncOperation"); condition.Reason == "AsyncCreateFailure" {
+			logger.Info("service account failed to create")
+			programmedCondition.Reason = "ServiceAccountFailedToCreate"
+			// TODO(jreese) should we only pass this through for locations in the same
+			// datum project (cluster for multicluster-runtime) as the instance?
+			programmedCondition.Message = fmt.Sprintf("Service account failed to create: %s", condition.Message)
+			return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
+		}
+
+		// TODO(jreese) add IAM Policy to the GCP service account to allow the service
+		// account used by Crossplane the `roles/iam.serviceAccountUser` role,
+		// so that it can create instances with the service account without needing a
+		// project level role binding. Probably just pass in the service account
+		// email, otherwise we'd have to do some kind of discovery.
+
+		if hasAggregatedSecret {
+			proceed, err := r.reconcileGCPSecrets(
+				ctx,
+				clusterName,
+				location,
+				downstreamClient,
+				&programmedCondition,
+				cloudConfig,
+				workload,
+				aggregatedK8sSecret,
+				serviceAccount,
+			)
+			if !proceed || err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+
+		// It's unlikely that we will hit this condition, as we wait for secrets
+		// above to be ready and return early if they are not. However, it's good to
+		// check.
+		if _, ok := serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalCreateSucceeded]; !ok {
+			logger.Info("service account not created yet", "service_account", serviceAccount.Name)
+			programmedCondition.Reason = "ProvisioningServiceAccount"
+			programmedCondition.Message = "Service account is being provisioned for the workload"
+			return ctrl.Result{}, nil
+		}
+
+		gcpInstance, err := r.reconcileGCPInstance(
+			ctx,
+			clusterName,
+			upstreamClient,
+			downstreamClient,
+			location,
+			workload,
+			workloadDeployment,
+			instance,
+			cloudConfig,
+			instanceMetadata,
+			serviceAccount,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+			logger.Info("GCP instance not ready yet")
+			programmedCondition.Reason = "ProvisioningProviderInstance"
+			programmedCondition.Message = "GCP instance is being provisioned"
+
+			return ctrl.Result{}, nil
+		}
+
+		programmedCondition.Status = metav1.ConditionTrue
+		programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
+		programmedCondition.Message = "Instance has been programmed"
+		instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
+			ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
+		}
+
+		// TODO(jreese) remove when we have workload-operator define these
+		if len(instance.Status.NetworkInterfaces) == 0 {
+			instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(gcpInstance.Status.AtProvider.NetworkInterface))
+		}
+
+		for i, gcpNetworkInterface := range gcpInstance.Status.AtProvider.NetworkInterface {
+			interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
+			if gcpNetworkInterface.NetworkIP != nil {
+				interfaceStatus.Assignments.NetworkIP = gcpNetworkInterface.NetworkIP
+			}
+
+			for _, accessConfig := range gcpNetworkInterface.AccessConfig {
+				if accessConfig.NATIP != nil {
+					interfaceStatus.Assignments.ExternalIP = accessConfig.NATIP
+				}
+			}
+
+			instance.Status.NetworkInterfaces[i] = interfaceStatus
+		}
+	} else if location.Spec.Provider.AWS != nil {
+
+		var secretsParameter *awsssmv1beta1.Parameter
+		if hasAggregatedSecret {
+			param, proceed, err := r.reconcileAWSSecrets(
+				ctx,
+				clusterName,
+				location,
+				downstreamClient,
+				&programmedCondition,
+				cloudConfig,
+				workloadDeployment,
+				aggregatedK8sSecret,
+			)
+			if !proceed || err != nil {
+				return ctrl.Result{}, err
+			}
+
+			secretsParameter = param
+
+			cloudConfig.AWSRegion = location.Spec.Provider.AWS.Region
+			cloudConfig.SecretsParameterName = *secretsParameter.Status.AtProvider.ID
+		}
+
+		var instanceProfileRole awsiamv1beta1.Role
+		instanceProfileRoleObjectKey := client.ObjectKey{
+			Name: fmt.Sprintf("workload-%s", workload.UID),
+		}
+		if err := downstreamClient.Get(ctx, instanceProfileRoleObjectKey, &instanceProfileRole); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching instance profile role: %w", err)
+		}
+
+		if instanceProfileRole.CreationTimestamp.IsZero() {
+			instanceProfileRole = awsiamv1beta1.Role{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: instanceProfileRoleObjectKey.Name,
+					Annotations: map[string]string{
+						downstreamclient.UpstreamOwnerName:        workload.Name,
+						downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+						downstreamclient.UpstreamOwnerClusterName: clusterName,
+					},
+				},
+				Spec: awsiamv1beta1.RoleSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("AWS", clusterName),
+						},
+					},
+					ForProvider: awsiamv1beta1.RoleParameters{
+						AssumeRolePolicy: ptr.To(text.Dedent(`
+							{
+								"Version": "2012-10-17",
+								"Statement": [
+									{
+										"Effect": "Allow",
+										"Principal": {
+											"Service": "ec2.amazonaws.com"
+										},
+										"Action": "sts:AssumeRole"
+									}
+								]
+							}
+						`)),
+					},
+				},
+			}
+
+			if secretsParameter != nil {
+				instanceProfileRole.Spec.ForProvider.InlinePolicy = append(instanceProfileRole.Spec.ForProvider.InlinePolicy, awsiamv1beta1.InlinePolicyParameters{
+					Name: ptr.To("ssm-read"),
+					Policy: ptr.To(fmt.Sprintf(text.Dedent(`
+						{
+							"Version": "2012-10-17",
+							"Statement": [
+								{
+									"Effect": "Allow",
+									"Action": "ssm:GetParameter",
+									"Resource": "%s"
+								}
+							]
+						}
+					`),
+						*secretsParameter.Status.AtProvider.Arn,
+					)),
+				})
+			}
+
+			if err := downstreamClient.Create(ctx, &instanceProfileRole); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create instance profile role: %w", err)
+			}
+		}
+
+		var instanceProfile awsiamv1beta1.InstanceProfile
+		instanceProfileObjectKey := client.ObjectKey{
+			Name: fmt.Sprintf("workload-%s", workload.UID),
+		}
+		if err := downstreamClient.Get(ctx, instanceProfileObjectKey, &instanceProfile); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching instance profile: %w", err)
+		}
+
+		if instanceProfile.CreationTimestamp.IsZero() {
+			instanceProfile = awsiamv1beta1.InstanceProfile{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: instanceProfileObjectKey.Name,
+					Annotations: map[string]string{
+						downstreamclient.UpstreamOwnerName:        workload.Name,
+						downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+						downstreamclient.UpstreamOwnerClusterName: clusterName,
+					},
+				},
+				Spec: awsiamv1beta1.InstanceProfileSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("AWS", clusterName),
+						},
+					},
+					ForProvider: awsiamv1beta1.InstanceProfileParameters{
+						RoleRef: &crossplanecommonv1.Reference{
+							Name: instanceProfileRole.Name,
+						},
+					},
+				},
+			}
+
+			if err := downstreamClient.Create(ctx, &instanceProfile); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create instance profile: %w", err)
+			}
+		}
+
+		var awsInstance awsec2v1beta1.Instance
+		instanceObjectKey := client.ObjectKey{
+			Name: fmt.Sprintf("instance-%s", instance.UID),
+		}
+		if err := downstreamClient.Get(ctx, instanceObjectKey, &awsInstance); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching instance: %w", err)
+		}
+
+		if awsInstance.CreationTimestamp.IsZero() {
+			cloudConfig.Hostname = fmt.Sprintf("%s.%s.%s.cloud.datum-dns.net", instance.Name, instance.Namespace, strings.TrimPrefix(clusterName, "/"))
+			butaneConfig, err := cloudConfig.ToButane()
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to convert cloud config to ignition: %w", err)
+			}
+
+			ignitionConfigBytes, err := butaneConfig.ToIgnitionJSON()
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to generate ignition config: %w", err)
+			}
+
+			logger.Info("creating instance", "instance_name", instanceObjectKey.Name)
+			awsInstance = awsec2v1beta1.Instance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: instanceObjectKey.Name,
+					Annotations: map[string]string{
+						downstreamclient.UpstreamOwnerName:        instance.Name,
+						downstreamclient.UpstreamOwnerNamespace:   instance.Namespace,
+						downstreamclient.UpstreamOwnerClusterName: clusterName,
+					},
+				},
+				Spec: awsec2v1beta1.InstanceSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("AWS", clusterName),
+						},
+					},
+					ForProvider: awsec2v1beta1.InstanceParameters{
+						Region:           ptr.To(location.Spec.Provider.AWS.Region),
+						AvailabilityZone: ptr.To(location.Spec.Provider.AWS.Zone),
+						AMI:              ptr.To("ami-003496bc8140c472c"),
+						InstanceType:     ptr.To("t3a.micro"),
+						// TODO(jreese) remove
+						KeyName:            ptr.To("jreese@datum.net"),
+						IAMInstanceProfile: ptr.To(instanceProfile.Name),
+						UserDataBase64:     ptr.To(base64.StdEncoding.EncodeToString(ignitionConfigBytes)),
+					},
+				},
+			}
+
+			for interfaceIndex := range instance.Spec.NetworkInterfaces {
+				awsInstance.Spec.ForProvider.NetworkInterface = append(awsInstance.Spec.ForProvider.NetworkInterface, awsec2v1beta1.InstanceNetworkInterfaceParameters{
+					NetworkCardIndex: ptr.To(float64(0)),
+					DeviceIndex:      ptr.To(float64(interfaceIndex)),
+					NetworkInterfaceIDRef: &crossplanecommonv1.Reference{
+						Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
+					},
+				})
+			}
+
+			if err := downstreamClient.Create(ctx, &awsInstance); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create instance: %w", err)
+			}
+		}
+
+		if awsInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+			logger.Info("AWS instance not ready yet")
+			programmedCondition.Reason = "ProvisioningProviderInstance"
+			programmedCondition.Message = "AWS instance is being provisioned"
+
+			return ctrl.Result{}, nil
+		}
+
+		programmedCondition.Status = metav1.ConditionTrue
+		programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
+		programmedCondition.Message = "Instance has been programmed"
+		instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
+			ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
+		}
+
+		if len(instance.Status.NetworkInterfaces) == 0 {
+			instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(instance.Spec.NetworkInterfaces))
+		}
+
+		for interfaceIndex := range instance.Spec.NetworkInterfaces {
+			var networkInterface awsec2v1beta1.NetworkInterface
+			networkInterfaceObjectKey := client.ObjectKey{
+				Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
+			}
+			if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, fmt.Errorf("failed fetching network interface: %w", err)
+			}
+
+			interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
+			interfaceStatus.Assignments.NetworkIP = networkInterface.Status.AtProvider.PrivateIP
+
+			var publicIP awsec2v1beta1.EIP
+			publicIPObjectKey := client.ObjectKey{
+				Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
+			}
+			if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
+				return ctrl.Result{}, fmt.Errorf("failed fetching public IP: %w", err)
+			}
+
+			if !publicIP.CreationTimestamp.IsZero() {
+				interfaceStatus.Assignments.ExternalIP = publicIP.Status.AtProvider.PublicIP
+			}
+
+			instance.Status.NetworkInterfaces[interfaceIndex] = interfaceStatus
+		}
+
+		runningCondition := metav1.Condition{
+			Type:               computev1alpha.InstanceRunning,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: instance.Generation,
+			Reason:             computev1alpha.InstanceRunningReasonStopped,
+			Message:            "Instance is not running",
+		}
+
+		if ptr.Deref(awsInstance.Status.AtProvider.InstanceState, "") == "running" {
+			runningCondition.Status = metav1.ConditionTrue
+			runningCondition.Reason = computev1alpha.InstanceRunningReasonRunning
+			runningCondition.Message = "Instance is running"
+		}
+
+		if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
+			if err := upstreamClient.Status().Update(ctx, instance); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
+			}
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -405,7 +671,7 @@ func (r *InstanceReconciler) reconcileInstance(
 func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
-	gcpProject string,
+	location networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
@@ -593,7 +859,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	return r.reconcileInstance(
 		ctx,
 		clusterName,
-		gcpProject,
+		location,
 		upstreamClient,
 		downstreamStrategy,
 		downstreamClient,
@@ -608,7 +874,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
-	gcpProject string,
+	location networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
@@ -678,7 +944,7 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	return r.reconcileInstance(
 		ctx,
 		clusterName,
-		gcpProject,
+		location,
 		upstreamClient,
 		downstreamStrategy,
 		downstreamClient,
@@ -730,20 +996,19 @@ func (r *InstanceReconciler) buildConfigMaps(
 	return nil
 }
 
-func (r *InstanceReconciler) reconcileSecrets(
+// reconcileAggregatedSecret aggregates secret data into a single secret which
+// can be used to populate provider secret stores.
+//
+// The second return value indicates whether or not secret material exists for
+// the workload.
+func (r *InstanceReconciler) reconcileAggregatedSecret(
 	ctx context.Context,
-	clusterName string,
-	gcpProject string,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
-	programmedCondition *metav1.Condition,
-	cloudConfig *cloudinit.CloudConfig,
-	workload *computev1alpha.Workload,
 	instance *computev1alpha.Instance,
-	serviceAccount gcpcloudplatformv1beta1.ServiceAccount,
-) (bool, error) {
-	logger := log.FromContext(ctx)
+	workload *computev1alpha.Workload,
+) (*corev1.Secret, bool, error) {
 	var objectKeys []client.ObjectKey
 	for _, volume := range instance.Spec.Volumes {
 		if volume.Secret != nil {
@@ -755,7 +1020,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	if len(objectKeys) == 0 {
-		return true, nil
+		return nil, false, nil
 	}
 
 	// Aggregate secret data into one value by creating a map of secret names
@@ -765,7 +1030,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	for _, objectKey := range objectKeys {
 		var k8ssecret corev1.Secret
 		if err := upstreamClient.Get(ctx, objectKey, &k8ssecret); err != nil {
-			return false, fmt.Errorf("failed fetching secret: %w", err)
+			return nil, false, fmt.Errorf("failed fetching secret: %w", err)
 		}
 
 		secretData[k8ssecret.Name] = k8ssecret.Data
@@ -773,12 +1038,12 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 	secretBytes, err := json.Marshal(secretData)
 	if err != nil {
-		return false, fmt.Errorf("failed to marshal secret data")
+		return nil, false, fmt.Errorf("failed to marshal secret data")
 	}
 
 	downstreamNamespaceName, err := downstreamStrategy.GetDownstreamNamespaceName(ctx, instance)
 	if err != nil {
-		return false, fmt.Errorf("failed to get downstream namespace name: %w", err)
+		return nil, false, fmt.Errorf("failed to get downstream namespace name: %w", err)
 	}
 
 	// NOTE: This is garbage collected in the workload controller.
@@ -801,8 +1066,101 @@ func (r *InstanceReconciler) reconcileSecrets(
 	})
 
 	if err != nil {
-		return false, fmt.Errorf("failed to reconcile aggregated k8s secret: %w", err)
+		return nil, false, fmt.Errorf("failed to reconcile aggregated k8s secret: %w", err)
 	}
+
+	return aggregatedK8sSecret, true, nil
+}
+
+func (r *InstanceReconciler) reconcileAWSSecrets(
+	ctx context.Context,
+	clusterName string,
+	location networkingv1alpha.Location,
+	downstreamClient client.Client,
+	programmedCondition *metav1.Condition,
+	cloudConfig *cloudinit.CloudConfig,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+	aggregatedK8sSecret *corev1.Secret,
+) (*awsssmv1beta1.Parameter, bool, error) {
+	logger := log.FromContext(ctx)
+
+	var secretsParameter awsssmv1beta1.Parameter
+	secretsParameterObjectKey := client.ObjectKey{
+		Name: fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
+	}
+	if err := downstreamClient.Get(ctx, secretsParameterObjectKey, &secretsParameter); client.IgnoreNotFound(err) != nil {
+		return nil, false, fmt.Errorf("failed fetching secrets parameter: %w", err)
+	}
+
+	if secretsParameter.CreationTimestamp.IsZero() {
+		secretsParameter = awsssmv1beta1.Parameter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: secretsParameterObjectKey.Name,
+				Annotations: map[string]string{
+					downstreamclient.UpstreamOwnerName:        workloadDeployment.Name,
+					downstreamclient.UpstreamOwnerNamespace:   workloadDeployment.Namespace,
+					downstreamclient.UpstreamOwnerClusterName: clusterName,
+				},
+			},
+			Spec: awsssmv1beta1.ParameterSpec{
+				ResourceSpec: crossplanecommonv1.ResourceSpec{
+					ProviderConfigReference: &crossplanecommonv1.Reference{
+						Name: r.Config.GetProviderConfigName("AWS", clusterName),
+					},
+				},
+				ForProvider: awsssmv1beta1.ParameterParameters_2{
+					Region:    ptr.To(location.Spec.Provider.AWS.Region),
+					Overwrite: ptr.To(true),
+					Type:      ptr.To("SecureString"),
+					ValueSecretRef: &crossplanecommonv1.SecretKeySelector{
+						SecretReference: crossplanecommonv1.SecretReference{
+							Namespace: aggregatedK8sSecret.Namespace,
+							Name:      aggregatedK8sSecret.Name,
+						},
+						Key: "secretData",
+					},
+				},
+			},
+		}
+
+		if err := downstreamClient.Create(ctx, &secretsParameter); err != nil {
+			return nil, false, fmt.Errorf("failed to create secrets parameter: %w", err)
+		}
+	}
+
+	if secretsParameter.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+		logger.Info("secret not ready yet", "secret", secretsParameter.Name)
+		programmedCondition.Reason = "ProvisioningSecret"
+		programmedCondition.Message = "Secret is being provisioned for the workload"
+		return nil, false, nil
+	}
+
+	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
+		Encoding:    "b64",
+		Content:     base64.StdEncoding.EncodeToString([]byte(awsPopulateSecretsScript)),
+		Owner:       "root:root",
+		Path:        "/etc/secrets/populate_secrets_from_ssm.sh",
+		Permissions: "0700",
+	})
+
+	// TODO(jreese) updates? Do we need to hash the secret data and put an
+	// annotation on the parameter?
+
+	return &secretsParameter, true, nil
+}
+
+func (r *InstanceReconciler) reconcileGCPSecrets(
+	ctx context.Context,
+	clusterName string,
+	location networkingv1alpha.Location,
+	downstreamClient client.Client,
+	programmedCondition *metav1.Condition,
+	cloudConfig *cloudinit.CloudConfig,
+	workload *computev1alpha.Workload,
+	aggregatedK8sSecret *corev1.Secret,
+	serviceAccount gcpcloudplatformv1beta1.ServiceAccount,
+) (bool, error) {
+	logger := log.FromContext(ctx)
 
 	// Create a secret in the secret manager service, grant access to the service
 	// account specific to the deployment.
@@ -836,11 +1194,11 @@ func (r *InstanceReconciler) reconcileSecrets(
 					},
 					DeletionPolicy: crossplanecommonv1.DeletionDelete,
 					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: r.Config.GetProviderConfigName(clusterName),
+						Name: r.Config.GetProviderConfigName("GCP", clusterName),
 					},
 				},
 				ForProvider: gcpsecretmanagerv1beta2.SecretParameters{
-					Project: ptr.To(gcpProject),
+					Project: ptr.To(location.Spec.Provider.GCP.ProjectID),
 					Replication: &gcpsecretmanagerv1beta2.ReplicationParameters{
 						Auto: &gcpsecretmanagerv1beta2.AutoParameters{},
 					},
@@ -870,7 +1228,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 	}
 
 	result, err := controllerutil.CreateOrPatch(ctx, downstreamClient, secretVersion, func() error {
-		if controllerutil.SetOwnerReference(&secret, secretVersion, downstreamClient.Scheme()) != nil {
+		if err := controllerutil.SetOwnerReference(&secret, secretVersion, downstreamClient.Scheme()); err != nil {
 			return fmt.Errorf("failed to set owner reference on secret version: %w", err)
 		}
 
@@ -926,7 +1284,7 @@ func (r *InstanceReconciler) reconcileSecrets(
 
 	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
 		Encoding:    "b64",
-		Content:     base64.StdEncoding.EncodeToString([]byte(populateSecretsScript)),
+		Content:     base64.StdEncoding.EncodeToString([]byte(gcpPopulateSecretsScript)),
 		Owner:       "root:root",
 		Path:        "/etc/secrets/populate_secrets.py",
 		Permissions: "0755",
@@ -955,16 +1313,16 @@ func (r *InstanceReconciler) reconcileSecrets(
 					},
 					DeletionPolicy: crossplanecommonv1.DeletionDelete,
 					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: r.Config.GetProviderConfigName(clusterName),
+						Name: r.Config.GetProviderConfigName("GCP", clusterName),
 					},
 				},
 				ForProvider: gcpsecretmanagerv1beta2.SecretIAMMemberParameters{
-					Project: ptr.To(gcpProject),
+					Project: ptr.To(location.Spec.Provider.GCP.ProjectID),
 					SecretIDRef: &crossplanecommonv1.Reference{
 						Name: secret.Name,
 					},
 					Role:   ptr.To("roles/secretmanager.secretAccessor"),
-					Member: ptr.To(fmt.Sprintf("serviceAccount:%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], gcpProject)),
+					Member: ptr.To(fmt.Sprintf("serviceAccount:%s@%s.iam.gserviceaccount.com", serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalName], location.Spec.Provider.GCP.ProjectID)),
 				},
 			},
 		}
@@ -1002,8 +1360,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	clusterName string,
 	upstreamClient client.Client,
 	downstreamClient client.Client,
-	gcpProject string,
-	gcpZone string,
+	location networkingv1alpha.Location,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
@@ -1014,6 +1371,8 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	logger := log.FromContext(ctx)
 
 	runtimeSpec := instance.Spec.Runtime
+	gcpProject := location.Spec.Provider.GCP.ProjectID
+	gcpZone := location.Spec.Provider.GCP.Zone
 
 	gcpInstance := &gcpcomputev1beta2.Instance{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1057,7 +1416,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 			},
 			DeletionPolicy: crossplanecommonv1.DeletionDelete,
 			ProviderConfigReference: &crossplanecommonv1.Reference{
-				Name: r.Config.GetProviderConfigName(clusterName),
+				Name: r.Config.GetProviderConfigName("GCP", clusterName),
 			},
 		}
 
@@ -1122,7 +1481,7 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 		return nil, fmt.Errorf("instance created in STOPPING state, retrying create")
 	}
 
-	if err := r.syncInstancePowerState(ctx, upstreamClient, instance, gcpInstance); err != nil {
+	if err := r.syncGCPInstancePowerState(ctx, upstreamClient, instance, gcpInstance); err != nil {
 		return nil, fmt.Errorf("failed to sync instance power state: %w", err)
 	}
 
@@ -1326,16 +1685,18 @@ func (r *InstanceReconciler) buildGCPInstanceNetworkInterfaces(
 	return nil
 }
 
-func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
+func (r *InstanceReconciler) reconcileNetworkInterfaces(
 	ctx context.Context,
 	clusterName string,
-	gcpProject string,
+	location networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
+	instance *computev1alpha.Instance,
 ) error {
 	logger := log.FromContext(ctx)
+
 	for interfaceIndex, networkInterface := range workloadDeployment.Spec.Template.Spec.NetworkInterfaces {
 		interfacePolicy := networkInterface.NetworkPolicy
 		if interfacePolicy == nil {
@@ -1370,7 +1731,224 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 			return fmt.Errorf("failed to get network: %w", err)
 		}
 
-		for ruleIndex, ingressRule := range interfacePolicy.Ingress {
+		if location.Spec.Provider.AWS != nil {
+			var securityGroup awsec2v1beta1.SecurityGroup
+			securityGroupObjectKey := client.ObjectKey{
+				Name: fmt.Sprintf("workload-%s-net-%d", workload.UID, interfaceIndex),
+			}
+			if err := downstreamClient.Get(ctx, securityGroupObjectKey, &securityGroup); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf("failed fetching security group: %w", err)
+			}
+
+			if securityGroup.CreationTimestamp.IsZero() {
+				logger.Info("creating security group for interface policy", "security_group_name", securityGroupObjectKey.Name)
+				securityGroup = awsec2v1beta1.SecurityGroup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: securityGroupObjectKey.Name,
+						Annotations: map[string]string{
+							downstreamclient.UpstreamOwnerName:        workload.Name,
+							downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+							downstreamclient.UpstreamOwnerClusterName: clusterName,
+						},
+					},
+					Spec: awsec2v1beta1.SecurityGroupSpec{
+						ResourceSpec: crossplanecommonv1.ResourceSpec{
+							ProviderConfigReference: &crossplanecommonv1.Reference{
+								Name: r.Config.GetProviderConfigName("AWS", clusterName),
+							},
+						},
+						ForProvider: awsec2v1beta1.SecurityGroupParameters_2{
+							Region: ptr.To(location.Spec.Provider.AWS.Region),
+							VPCIDRef: &crossplanecommonv1.Reference{
+								Name: fmt.Sprintf("networkcontext-%s", networkContext.UID),
+							},
+						},
+					},
+				}
+
+				if err := downstreamClient.Create(ctx, &securityGroup); err != nil {
+					return fmt.Errorf("failed to create security group: %w", err)
+				}
+			}
+
+			var securityGroupEgressRule awsec2v1beta1.SecurityGroupRule
+			securityGroupEgressRuleObjectKey := client.ObjectKey{
+				Name: fmt.Sprintf("workload-%s-net-%d-egress", workload.UID, interfaceIndex),
+			}
+			if err := downstreamClient.Get(ctx, securityGroupEgressRuleObjectKey, &securityGroupEgressRule); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf("failed fetching security group egress rule: %w", err)
+			}
+
+			if securityGroupEgressRule.CreationTimestamp.IsZero() {
+				logger.Info("creating security group egress rule", "security_group_rule_name", securityGroupEgressRuleObjectKey.Name)
+				securityGroupEgressRule = awsec2v1beta1.SecurityGroupRule{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: securityGroupEgressRuleObjectKey.Name,
+						Annotations: map[string]string{
+							downstreamclient.UpstreamOwnerName:        workload.Name,
+							downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+							downstreamclient.UpstreamOwnerClusterName: clusterName,
+						},
+					},
+					Spec: awsec2v1beta1.SecurityGroupRuleSpec{
+						ResourceSpec: crossplanecommonv1.ResourceSpec{
+							ProviderConfigReference: &crossplanecommonv1.Reference{
+								Name: r.Config.GetProviderConfigName("AWS", clusterName),
+							},
+						},
+						ForProvider: awsec2v1beta1.SecurityGroupRuleParameters_2{
+							Region: ptr.To(location.Spec.Provider.AWS.Region),
+							SecurityGroupIDRef: &crossplanecommonv1.Reference{
+								Name: fmt.Sprintf("workload-%s-net-%d", workload.UID, interfaceIndex),
+							},
+							Type:     ptr.To("egress"),
+							Protocol: ptr.To("all"),
+							FromPort: ptr.To(float64(0)),
+							ToPort:   ptr.To(float64(65535)),
+							CidrBlocks: []*string{
+								ptr.To("0.0.0.0/0"),
+							},
+						},
+					},
+				}
+
+				if err := downstreamClient.Create(ctx, &securityGroupEgressRule); err != nil {
+					return fmt.Errorf("failed to create security group egress rule: %w", err)
+				}
+			}
+
+			var networkInterface awsec2v1beta1.NetworkInterface
+			networkInterfaceObjectKey := client.ObjectKey{
+				Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
+			}
+			if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf("failed fetching network interface: %w", err)
+			}
+
+			if networkInterface.CreationTimestamp.IsZero() {
+				// Fetch the first subnet in the network context
+				// TODO(jreese) have the workload-operator specify the subnet to use
+				// in the instance status before the Network gate is removed.
+				var subnet networkingv1alpha.Subnet
+				subnetObjectKey := client.ObjectKey{
+					Namespace: networkContext.Namespace,
+					Name:      fmt.Sprintf("%s-0", networkContext.Name),
+				}
+				if err := upstreamClient.Get(ctx, subnetObjectKey, &subnet); err != nil {
+					return fmt.Errorf("failed fetching subnet: %w", err)
+				}
+
+				logger.Info("creating network interface", "network_interface_name", networkInterfaceObjectKey.Name)
+				networkInterface = awsec2v1beta1.NetworkInterface{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: networkInterfaceObjectKey.Name,
+						Annotations: map[string]string{
+							downstreamclient.UpstreamOwnerName:        instance.Name,
+							downstreamclient.UpstreamOwnerNamespace:   instance.Namespace,
+							downstreamclient.UpstreamOwnerClusterName: clusterName,
+						},
+					},
+					Spec: awsec2v1beta1.NetworkInterfaceSpec{
+						ResourceSpec: crossplanecommonv1.ResourceSpec{
+							ProviderConfigReference: &crossplanecommonv1.Reference{
+								Name: r.Config.GetProviderConfigName("AWS", clusterName),
+							},
+						},
+						ForProvider: awsec2v1beta1.NetworkInterfaceParameters_2{
+							Region: ptr.To(location.Spec.Provider.AWS.Region),
+							SubnetIDRef: &crossplanecommonv1.Reference{
+								Name: fmt.Sprintf("subnet-%s", subnet.UID),
+							},
+							SecurityGroupRefs: []crossplanecommonv1.Reference{
+								{
+									Name: securityGroupObjectKey.Name,
+								},
+							},
+						},
+					},
+				}
+
+				if err := downstreamClient.Create(ctx, &networkInterface); err != nil {
+					return fmt.Errorf("failed to create network interface: %w", err)
+				}
+
+				if interfaceIndex == 0 {
+					var publicIP awsec2v1beta1.EIP
+					publicIPObjectKey := client.ObjectKey{
+						Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
+					}
+					if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
+						return fmt.Errorf("failed fetching public IP: %w", err)
+					}
+
+					if publicIP.CreationTimestamp.IsZero() {
+						logger.Info("creating public IP", "public_ip_name", publicIPObjectKey.Name)
+						publicIP = awsec2v1beta1.EIP{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: publicIPObjectKey.Name,
+								Annotations: map[string]string{
+									downstreamclient.UpstreamOwnerName:        instance.Name,
+									downstreamclient.UpstreamOwnerNamespace:   instance.Namespace,
+									downstreamclient.UpstreamOwnerClusterName: clusterName,
+								},
+							},
+							Spec: awsec2v1beta1.EIPSpec{
+								ResourceSpec: crossplanecommonv1.ResourceSpec{
+									ProviderConfigReference: &crossplanecommonv1.Reference{
+										Name: r.Config.GetProviderConfigName("AWS", clusterName),
+									},
+								},
+								ForProvider: awsec2v1beta1.EIPParameters{
+									Region: ptr.To(location.Spec.Provider.AWS.Region),
+									Domain: ptr.To("vpc"),
+									NetworkInterfaceRef: &crossplanecommonv1.Reference{
+										Name: networkInterfaceObjectKey.Name,
+									},
+								},
+							},
+						}
+
+						if err := downstreamClient.Create(ctx, &publicIP); err != nil {
+							return fmt.Errorf("failed to create public IP: %w", err)
+						}
+					}
+				}
+			}
+
+		}
+
+		if err := r.reconcileNetworkInterfaceNetworkPolicies(
+			ctx,
+			clusterName,
+			location,
+			downstreamClient,
+			workload,
+			workloadDeployment,
+			network,
+			interfaceIndex,
+			interfacePolicy,
+		); err != nil {
+			return fmt.Errorf("failed reconciling network interface network policies: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
+	ctx context.Context,
+	clusterName string,
+	location networkingv1alpha.Location,
+	downstreamClient client.Client,
+	workload *computev1alpha.Workload,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+	network networkingv1alpha.Network,
+	interfaceIndex int,
+	interfacePolicy *computev1alpha.InstanceNetworkInterfaceNetworkPolicy,
+) error {
+	logger := log.FromContext(ctx)
+
+	for ruleIndex, ingressRule := range interfacePolicy.Ingress {
+		if location.Spec.Provider.GCP != nil {
 			// This could result in duplicate firewall rules if a workload that spans
 			// multiple contexts of the same network is created. This is considered
 			// ok for the time being, as the move to effective network policies for
@@ -1405,11 +1983,11 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 							},
 							DeletionPolicy: crossplanecommonv1.DeletionDelete,
 							ProviderConfigReference: &crossplanecommonv1.Reference{
-								Name: r.Config.GetProviderConfigName(clusterName),
+								Name: r.Config.GetProviderConfigName("GCP", clusterName),
 							},
 						},
 						ForProvider: gcpcomputev1beta2.FirewallParameters{
-							Project: ptr.To(gcpProject),
+							Project: ptr.To(location.Spec.Provider.GCP.ProjectID),
 							Description: ptr.To(fmt.Sprintf(
 								"instance interface policy for %s: interfaceIndex:%d, ruleIndex:%d",
 								workloadDeployment.Name,
@@ -1470,12 +2048,77 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 					return fmt.Errorf("failed to create firewall: %w", err)
 				}
 			}
+		} else if location.Spec.Provider.AWS != nil {
+			for portIndex, port := range ingressRule.Ports {
+				if port.Port == nil {
+					logger.Info("skipping interface policy rule with no port", "rule_index", ruleIndex, "port_index", portIndex)
+					continue
+				}
+
+				ipProtocol := "tcp"
+				if port.Protocol != nil {
+					ipProtocol = strings.ToLower(string(*port.Protocol))
+				}
+
+				var securityGroupRule awsec2v1beta1.SecurityGroupRule
+				securityGroupRuleObjectKey := client.ObjectKey{
+					Name: fmt.Sprintf("workload-%s-net-%d-%d-%d", workload.UID, interfaceIndex, ruleIndex, portIndex),
+				}
+				if err := downstreamClient.Get(ctx, securityGroupRuleObjectKey, &securityGroupRule); client.IgnoreNotFound(err) != nil {
+					return fmt.Errorf("failed fetching security group rule: %w", err)
+				}
+
+				if securityGroupRule.CreationTimestamp.IsZero() {
+					logger.Info("creating security group rule for interface policy rule", "security_group_rule_name", securityGroupRuleObjectKey.Name)
+					securityGroupRule = awsec2v1beta1.SecurityGroupRule{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: securityGroupRuleObjectKey.Name,
+							Annotations: map[string]string{
+								downstreamclient.UpstreamOwnerName:        workload.Name,
+								downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+								downstreamclient.UpstreamOwnerClusterName: clusterName,
+							},
+						},
+						Spec: awsec2v1beta1.SecurityGroupRuleSpec{
+							ResourceSpec: crossplanecommonv1.ResourceSpec{
+								ProviderConfigReference: &crossplanecommonv1.Reference{
+									Name: r.Config.GetProviderConfigName("AWS", clusterName),
+								},
+							},
+							ForProvider: awsec2v1beta1.SecurityGroupRuleParameters_2{
+								Region: ptr.To(location.Spec.Provider.AWS.Region),
+								SecurityGroupIDRef: &crossplanecommonv1.Reference{
+									Name: fmt.Sprintf("workload-%s-net-%d", workload.UID, interfaceIndex),
+								},
+								Type:     ptr.To("ingress"),
+								Protocol: ptr.To(ipProtocol),
+								FromPort: ptr.To(float64(port.Port.IntValue())),
+								ToPort:   ptr.To(float64(port.Port.IntValue())),
+							},
+						},
+					}
+
+					if port.EndPort != nil {
+						securityGroupRule.Spec.ForProvider.ToPort = ptr.To(float64(*port.EndPort))
+					}
+
+					for _, peer := range ingressRule.From {
+						if peer.IPBlock != nil {
+							securityGroupRule.Spec.ForProvider.CidrBlocks = append(securityGroupRule.Spec.ForProvider.CidrBlocks, ptr.To(peer.IPBlock.CIDR))
+						}
+					}
+
+					if err := downstreamClient.Create(ctx, &securityGroupRule); err != nil {
+						return fmt.Errorf("failed to create security group rule: %w", err)
+					}
+				}
+			}
 		}
 	}
 	return nil
 }
 
-func (r *InstanceReconciler) syncInstancePowerState(
+func (r *InstanceReconciler) syncGCPInstancePowerState(
 	ctx context.Context,
 	upstreamClient client.Client,
 	instance *computev1alpha.Instance,
@@ -1586,7 +2229,7 @@ func (r *InstanceReconciler) Finalize(
 	// removed is the best we've got.
 	if !gcpInstance.CreationTimestamp.IsZero() && controllerutil.ContainsFinalizer(&gcpInstance, crossplaneFinalizer) {
 		logger.Info("downstream instance is being deleted")
-		return r.syncInstancePowerState(ctx, upstreamClient, instance, &gcpInstance)
+		return r.syncGCPInstancePowerState(ctx, upstreamClient, instance, &gcpInstance)
 	}
 
 	logger.Info("downstream instance deleted")
@@ -1625,6 +2268,32 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 
 				if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
 					logger.Info("GCP instance is missing upstream ownership metadata")
+					return nil
+				}
+
+				return []mcreconcile.Request{
+					{
+						Request: reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: upstreamNamespace,
+								Name:      upstreamName,
+							},
+						},
+						ClusterName: upstreamClusterName,
+					},
+				}
+			})
+		})).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &awsec2v1beta1.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*awsec2v1beta1.Instance, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *awsec2v1beta1.Instance) []mcreconcile.Request {
+				logger := log.FromContext(ctx)
+
+				upstreamClusterName := instance.Annotations[downstreamclient.UpstreamOwnerClusterName]
+				upstreamName := instance.Annotations[downstreamclient.UpstreamOwnerName]
+				upstreamNamespace := instance.Annotations[downstreamclient.UpstreamOwnerNamespace]
+
+				if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
+					logger.Info("AWS instance is missing upstream ownership metadata")
 					return nil
 				}
 

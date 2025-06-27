@@ -13,4 +13,5 @@ downstreamResourceManagement:
   kubeconfigPath: ../network-services-operator/infra.kubeconfig
   providerConfigStrategy:
     single:
-      name: project-test-fz3pr6
+      gcpName: project-test-fz3pr6
+      awsName: project-test-fz3pr6-demo-aws-project

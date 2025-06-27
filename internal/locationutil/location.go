@@ -26,9 +26,7 @@ func GetLocation(
 		return nil, false, fmt.Errorf("failed fetching location: %w", err)
 	}
 
-	if location.Spec.Provider.GCP == nil {
-		return &location, false, nil
-	}
+	// REMOVED(jreese) - we don't care about the provider type anymore
 
 	if len(locationClassName) == 0 {
 		return &location, true, nil

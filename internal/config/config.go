@@ -255,26 +255,34 @@ type ProviderConfigStrategy struct {
 	Discovery DiscoveryProviderConfigStrategy `json:"discovery,omitempty"`
 }
 
-func (c *GCPProvider) GetProviderConfigName(clusterName string) string {
+func (c *GCPProvider) GetProviderConfigName(provider string, clusterName string) string {
 	switch c.Discovery.Mode {
 	case providers.ProviderSingle:
-		if c.DownstreamResourceManagement.ProviderConfigStrategy.Single.Name == "" {
-			panic("single provider config strategy name is required")
+		switch provider {
+		case "GCP":
+			return c.DownstreamResourceManagement.ProviderConfigStrategy.Single.GCPName
+		case "AWS":
+			return c.DownstreamResourceManagement.ProviderConfigStrategy.Single.AWSName
 		}
-		return c.DownstreamResourceManagement.ProviderConfigStrategy.Single.Name
+
 	default:
 		if c.DownstreamResourceManagement.ProviderConfigStrategy.Discovery.Prefix == "" {
 			return clusterName
 		}
 		return c.DownstreamResourceManagement.ProviderConfigStrategy.Discovery.Prefix + strings.TrimPrefix(clusterName, "/")
 	}
+
+	panic("unsupported provider")
 }
 
 // +k8s:deepcopy-gen=true
 
 type SingleProviderConfigStrategy struct {
-	// Name is the name of the provider config to use when managing downstream resources.
-	Name string `json:"name,omitempty"`
+	// GCPName is the name of the provider config to use when managing downstream resources in GCP.
+	GCPName string `json:"gcpName,omitempty"`
+
+	// AWSName is the name of the provider config to use when managing downstream resources in AWS.
+	AWSName string `json:"awsName,omitempty"`
 }
 
 // +k8s:deepcopy-gen=true

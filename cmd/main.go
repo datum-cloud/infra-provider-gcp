@@ -14,6 +14,9 @@ import (
 	"golang.org/x/sync/errgroup"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	awsec2v1beta1 "github.com/upbound/provider-aws/apis/ec2/v1beta1"
+	awsiamv1beta1 "github.com/upbound/provider-aws/apis/iam/v1beta1"
+	awsssmv1beta1 "github.com/upbound/provider-aws/apis/ssm/v1beta1"
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta1 "github.com/upbound/provider-gcp/apis/compute/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
@@ -59,6 +62,10 @@ func init() {
 
 	utilruntime.Must(config.AddToScheme(scheme))
 	utilruntime.Must(config.RegisterDefaults(scheme))
+
+	utilruntime.Must(awsec2v1beta1.AddToScheme(scheme))
+	utilruntime.Must(awsiamv1beta1.AddToScheme(scheme))
+	utilruntime.Must(awsssmv1beta1.AddToScheme(scheme))
 
 	utilruntime.Must(gcpv1beta1.SchemeBuilder.AddToScheme(scheme))
 	utilruntime.Must(gcpcomputev1beta1.AddToScheme(scheme))

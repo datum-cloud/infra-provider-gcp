@@ -138,6 +138,9 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 func (r *WorkloadReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
 
+	// TODO(jreese): Need to add a watch on the workload, and only consider
+	// adding a finalizer when it's relevant to this operator.
+
 	return mcbuilder.ControllerManagedBy(mgr).
 		Watches(&computev1alpha.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {

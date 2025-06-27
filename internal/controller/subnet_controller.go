@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
+	awsec2v1beta1 "github.com/upbound/provider-aws/apis/ec2/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -134,52 +135,101 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, req mcreconcile.Reques
 	)
 	downstreamClient := downstreamStrategy.GetClient()
 
-	downstreamSubnet := &gcpcomputev1beta2.Subnetwork{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("subnet-%s", subnet.UID),
-		},
-	}
-
-	if err := downstreamClient.Get(ctx, client.ObjectKey{Name: downstreamSubnet.Name}, downstreamSubnet); client.IgnoreNotFound(err) != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get downstream subnet: %w", err)
-	}
-
-	if downstreamSubnet.CreationTimestamp.IsZero() {
-		downstreamSubnet = &gcpcomputev1beta2.Subnetwork{
+	var downstreamSubnetStatus crossplanecommonv1.ResourceStatus
+	if location.Spec.Provider.GCP != nil {
+		downstreamSubnet := &gcpcomputev1beta2.Subnetwork{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: fmt.Sprintf("subnet-%s", subnet.UID),
-				Annotations: map[string]string{
-					downstreamclient.UpstreamOwnerName:        subnet.Name,
-					downstreamclient.UpstreamOwnerNamespace:   subnet.Namespace,
-					downstreamclient.UpstreamOwnerClusterName: req.ClusterName,
-				},
-			},
-			Spec: gcpcomputev1beta2.SubnetworkSpec{
-				ResourceSpec: crossplanecommonv1.ResourceSpec{
-					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: r.Config.GetProviderConfigName(req.ClusterName),
-					},
-				},
-				ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{
-					IPCidrRange: ptr.To(fmt.Sprintf("%s/%d", *subnet.Status.StartAddress, *subnet.Status.PrefixLength)),
-					NetworkRef: &crossplanecommonv1.Reference{
-						Name: fmt.Sprintf("network-%s", network.UID),
-					},
-					Project:   ptr.To(location.Spec.Provider.GCP.ProjectID),
-					Region:    ptr.To(location.Spec.Provider.GCP.Region),
-					Purpose:   ptr.To("PRIVATE"),
-					StackType: ptr.To("IPV4_ONLY"),
-				},
 			},
 		}
 
-		if err := downstreamClient.Create(ctx, downstreamSubnet); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to create downstream subnet: %w", err)
+		if err := downstreamClient.Get(ctx, client.ObjectKey{Name: downstreamSubnet.Name}, downstreamSubnet); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to get downstream subnet: %w", err)
 		}
+
+		if downstreamSubnet.CreationTimestamp.IsZero() {
+			downstreamSubnet = &gcpcomputev1beta2.Subnetwork{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("subnet-%s", subnet.UID),
+					Annotations: map[string]string{
+						downstreamclient.UpstreamOwnerName:        subnet.Name,
+						downstreamclient.UpstreamOwnerNamespace:   subnet.Namespace,
+						downstreamclient.UpstreamOwnerClusterName: req.ClusterName,
+					},
+				},
+				Spec: gcpcomputev1beta2.SubnetworkSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("GCP", req.ClusterName),
+						},
+					},
+					ForProvider: gcpcomputev1beta2.SubnetworkParameters_2{
+						IPCidrRange: ptr.To(fmt.Sprintf("%s/%d", *subnet.Status.StartAddress, *subnet.Status.PrefixLength)),
+						NetworkRef: &crossplanecommonv1.Reference{
+							Name: fmt.Sprintf("network-%s", network.UID),
+						},
+						Project:   ptr.To(location.Spec.Provider.GCP.ProjectID),
+						Region:    ptr.To(location.Spec.Provider.GCP.Region),
+						Purpose:   ptr.To("PRIVATE"),
+						StackType: ptr.To("IPV4_ONLY"),
+					},
+				},
+			}
+
+			if err := downstreamClient.Create(ctx, downstreamSubnet); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create downstream subnet: %w", err)
+			}
+		}
+
+		downstreamSubnetStatus = downstreamSubnet.Status.ResourceStatus
+	} else if location.Spec.Provider.AWS != nil {
+		downstreamSubnet := &awsec2v1beta1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("subnet-%s", subnet.UID),
+			},
+		}
+
+		if err := downstreamClient.Get(ctx, client.ObjectKey{Name: downstreamSubnet.Name}, downstreamSubnet); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to get downstream subnet: %w", err)
+		}
+
+		if downstreamSubnet.CreationTimestamp.IsZero() {
+			downstreamSubnet = &awsec2v1beta1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: fmt.Sprintf("subnet-%s", subnet.UID),
+					Annotations: map[string]string{
+						downstreamclient.UpstreamOwnerName:        subnet.Name,
+						downstreamclient.UpstreamOwnerNamespace:   subnet.Namespace,
+						downstreamclient.UpstreamOwnerClusterName: req.ClusterName,
+					},
+				},
+				Spec: awsec2v1beta1.SubnetSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("AWS", req.ClusterName),
+						},
+					},
+					ForProvider: awsec2v1beta1.SubnetParameters_2{
+						Region:           ptr.To(location.Spec.Provider.AWS.Region),
+						AvailabilityZone: ptr.To(location.Spec.Provider.AWS.Zone),
+						CidrBlock:        ptr.To(fmt.Sprintf("%s/%d", *subnet.Status.StartAddress, *subnet.Status.PrefixLength)),
+						VPCIDRef: &crossplanecommonv1.Reference{
+							Name: fmt.Sprintf("networkcontext-%s", networkContext.UID),
+						},
+					},
+				},
+			}
+
+			if err := downstreamClient.Create(ctx, downstreamSubnet); err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to create downstream subnet: %w", err)
+			}
+		}
+
+		downstreamSubnetStatus = downstreamSubnet.Status.ResourceStatus
 	}
 
-	if downstreamSubnet.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("GCP subnet not ready yet")
+	if downstreamSubnetStatus.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+		logger.Info("provider subnet not ready yet")
 
 		programmedCondition.Status = metav1.ConditionFalse
 		programmedCondition.Reason = networkingv1alpha.SubnetProgrammedReasonProgrammingInProgress
@@ -224,6 +274,32 @@ func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&networkingv1alpha.Subnet{}).
+		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &awsec2v1beta1.Subnet{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*awsec2v1beta1.Subnet, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, subnet *awsec2v1beta1.Subnet) []mcreconcile.Request {
+				logger := log.FromContext(ctx)
+
+				upstreamClusterName := subnet.Annotations[downstreamclient.UpstreamOwnerClusterName]
+				upstreamName := subnet.Annotations[downstreamclient.UpstreamOwnerName]
+				upstreamNamespace := subnet.Annotations[downstreamclient.UpstreamOwnerNamespace]
+
+				if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
+					logger.Info("AWS subnet is missing upstream ownership metadata")
+					return nil
+				}
+
+				return []mcreconcile.Request{
+					{
+						Request: reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: upstreamNamespace,
+								Name:      upstreamName,
+							},
+						},
+						ClusterName: upstreamClusterName,
+					},
+				}
+			})
+		})).
 		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Subnetwork, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, subnet *gcpcomputev1beta2.Subnetwork) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
