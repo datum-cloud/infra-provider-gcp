@@ -6,7 +6,7 @@ toolchain go1.24.1
 
 require (
 	github.com/crossplane/crossplane-runtime v1.17.0
-	github.com/go-logr/logr v1.4.2
+	github.com/go-logr/logr v1.4.3
 	github.com/stretchr/testify v1.10.0
 	github.com/upbound/provider-gcp v1.13.0
 	go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae
