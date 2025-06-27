@@ -1734,7 +1734,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaces(
 		if location.Spec.Provider.AWS != nil {
 			var securityGroup awsec2v1beta1.SecurityGroup
 			securityGroupObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("workload-%s-net-%d", workload.UID, interfaceIndex),
+				Name: fmt.Sprintf("workloaddeployment-%s-net-%d", workloadDeployment.UID, interfaceIndex),
 			}
 			if err := downstreamClient.Get(ctx, securityGroupObjectKey, &securityGroup); client.IgnoreNotFound(err) != nil {
 				return fmt.Errorf("failed fetching security group: %w", err)
@@ -1773,7 +1773,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaces(
 
 			var securityGroupEgressRule awsec2v1beta1.SecurityGroupRule
 			securityGroupEgressRuleObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("workload-%s-net-%d-egress", workload.UID, interfaceIndex),
+				Name: fmt.Sprintf("workloaddeployment-%s-net-%d-egress", workloadDeployment.UID, interfaceIndex),
 			}
 			if err := downstreamClient.Get(ctx, securityGroupEgressRuleObjectKey, &securityGroupEgressRule); client.IgnoreNotFound(err) != nil {
 				return fmt.Errorf("failed fetching security group egress rule: %w", err)
@@ -1799,7 +1799,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaces(
 						ForProvider: awsec2v1beta1.SecurityGroupRuleParameters_2{
 							Region: ptr.To(location.Spec.Provider.AWS.Region),
 							SecurityGroupIDRef: &crossplanecommonv1.Reference{
-								Name: fmt.Sprintf("workload-%s-net-%d", workload.UID, interfaceIndex),
+								Name: fmt.Sprintf("workloaddeployment-%s-net-%d", workloadDeployment.UID, interfaceIndex),
 							},
 							Type:     ptr.To("egress"),
 							Protocol: ptr.To("all"),
@@ -2062,7 +2062,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 
 				var securityGroupRule awsec2v1beta1.SecurityGroupRule
 				securityGroupRuleObjectKey := client.ObjectKey{
-					Name: fmt.Sprintf("workload-%s-net-%d-%d-%d", workload.UID, interfaceIndex, ruleIndex, portIndex),
+					Name: fmt.Sprintf("workloaddeployment-%s-net-%d-%d-%d", workloadDeployment.UID, interfaceIndex, ruleIndex, portIndex),
 				}
 				if err := downstreamClient.Get(ctx, securityGroupRuleObjectKey, &securityGroupRule); client.IgnoreNotFound(err) != nil {
 					return fmt.Errorf("failed fetching security group rule: %w", err)
