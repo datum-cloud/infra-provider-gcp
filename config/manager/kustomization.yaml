@@ -3,10 +3,7 @@ kind: Kustomization
 resources:
 - manager.yaml
 - service_account.yaml
-images:
-- name: controller
-  newName: infra-provider-gcp
-  newTag: latest
+
 configMapGenerator:
 - files:
   - config.yaml
