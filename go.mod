@@ -102,7 +102,7 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yuin/goldmark v1.4.13 // indirect
 	github.com/zclconf/go-cty v1.14.4 // indirect
-	go.miloapis.com/milo v0.0.0-20250626211327-1b06937505c9 // indirect
+	go.miloapis.com/milo v0.0.0-20250702165727-c016b9f5d66c // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.55.0 // indirect
 	go.opentelemetry.io/otel v1.35.0 // indirect
