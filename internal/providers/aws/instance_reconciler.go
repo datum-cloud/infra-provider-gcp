@@ -11,6 +11,8 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
@@ -53,23 +55,37 @@ func (b *instanceReconciler) Reconcile(
 	instance computev1alpha.Instance,
 	cloudConfig *cloudinit.CloudConfig,
 ) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
 	cloudConfig.AWSRegion = location.Spec.Provider.AWS.Region
 	cloudConfig.SecretsParameterName = "TODO" // Get from workload deployment scoped resource
 
 	cloudConfig.Hostname = fmt.Sprintf("%s.%s.%s.cloud.datum-dns.net", instance.Name, instance.Namespace, projectName)
-	butaneConfig, err := cloudConfig.ToButane()
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to convert cloud config to ignition: %w", err)
-	}
 
-	ignitionConfigBytes, err := butaneConfig.ToIgnitionJSON()
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to generate ignition config: %w", err)
+	var userData []byte
+
+	if instance.Spec.Runtime.VirtualMachine != nil {
+		// TODO(jreese) Test VM based instances!
+		cloudConfigBytes, err := cloudConfig.Generate()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed generating cloud init user data: %w", err)
+		}
+		userData = append([]byte("#cloud-config\n\n"), cloudConfigBytes...)
+	} else if instance.Spec.Runtime.Sandbox != nil {
+		butaneConfig, err := cloudConfig.ToButane()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to convert cloud config to ignition: %w", err)
+		}
+
+		ignitionConfigBytes, err := butaneConfig.ToIgnitionJSON()
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to generate ignition config: %w", err)
+		}
+		userData = ignitionConfigBytes
 	}
 
 	reconcileContext := &reconcileContext{
-		userData: ignitionConfigBytes,
+		userData: userData,
 	}
 
 	desiredResources, err := b.collectDesiredResources(reconcileContext)
@@ -77,12 +93,102 @@ func (b *instanceReconciler) Reconcile(
 		return ctrl.Result{}, err
 	}
 
-	_ = desiredResources
+	// Create Network interfaces
+	for _, desiredInterface := range desiredResources.networkInterfaces {
+		networkInterface := desiredInterface.DeepCopy()
+		result, err := controllerutil.CreateOrUpdate(ctx, downstreamClient, networkInterface, func() error {
+
+			// TODO(jreese) add any necessary annotations/labels for use in watches
+			// desiredInterface.Annotations = networkInterface.Annotations
+			// desiredInterface.Labels = networkInterface.Labels
+
+			// TODO(jreese) make sure we don't clobber spec values that crossplane
+			// may be updating.
+			networkInterface.Spec = desiredInterface.Spec
+
+			return nil
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed creating ENI: %w", err)
+		}
+
+		logger.Info("processed ENI", "name", networkInterface.Name, "result", result)
+	}
+
+	/*
+		if awsInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+					logger.Info("AWS instance not ready yet")
+					programmedCondition.Reason = "ProvisioningProviderInstance"
+					programmedCondition.Message = "AWS instance is being provisioned"
+
+					return ctrl.Result{}, nil
+				}
+
+				programmedCondition.Status = metav1.ConditionTrue
+				programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
+				programmedCondition.Message = "Instance has been programmed"
+				instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
+					ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
+				}
+
+				if len(instance.Status.NetworkInterfaces) == 0 {
+					instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(instance.Spec.NetworkInterfaces))
+				}
+
+				for interfaceIndex := range instance.Spec.NetworkInterfaces {
+					var networkInterface awsec2v1beta1.NetworkInterface
+					networkInterfaceObjectKey := client.ObjectKey{
+						Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
+					}
+					if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
+						return ctrl.Result{}, fmt.Errorf("failed fetching network interface: %w", err)
+					}
+
+					interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
+					interfaceStatus.Assignments.NetworkIP = networkInterface.Status.AtProvider.PrivateIP
+
+					var publicIP awsec2v1beta1.EIP
+					publicIPObjectKey := client.ObjectKey{
+						Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
+					}
+					if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
+						return ctrl.Result{}, fmt.Errorf("failed fetching public IP: %w", err)
+					}
+
+					if !publicIP.CreationTimestamp.IsZero() {
+						interfaceStatus.Assignments.ExternalIP = publicIP.Status.AtProvider.PublicIP
+					}
+
+					instance.Status.NetworkInterfaces[interfaceIndex] = interfaceStatus
+				}
+
+				runningCondition := metav1.Condition{
+					Type:               computev1alpha.InstanceRunning,
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: instance.Generation,
+					Reason:             computev1alpha.InstanceRunningReasonStopped,
+					Message:            "Instance is not running",
+				}
+
+				if ptr.Deref(awsInstance.Status.AtProvider.InstanceState, "") == "running" {
+					runningCondition.Status = metav1.ConditionTrue
+					runningCondition.Reason = computev1alpha.InstanceRunningReasonRunning
+					runningCondition.Message = "Instance is running"
+				}
+
+				if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
+					if err := upstreamClient.Status().Update(ctx, instance); err != nil {
+						return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
+					}
+				}
+	*/
 
 	return ctrl.Result{}, nil
 }
 
 func (b *instanceReconciler) RegisterWatches(builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error {
+	// TODO(jreese) add watches for at least the AWS Instance, consider it for
+	// other resources if necessary to avoid backoffs.
 	return nil
 }
 
