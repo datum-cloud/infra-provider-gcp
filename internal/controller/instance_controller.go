@@ -48,6 +48,8 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
+	"go.datum.net/infra-provider-gcp/internal/providers"
+	"go.datum.net/infra-provider-gcp/internal/providers/aws"
 	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	"go.datum.net/infra-provider-gcp/internal/util/text"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
@@ -71,6 +73,8 @@ type InstanceReconciler struct {
 	Config            config.GCPProvider
 	LocationClassName string
 	DownstreamCluster cluster.Cluster
+
+	awsInstanceReconciler providers.Reconciler
 }
 
 func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
@@ -163,6 +167,9 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	)
 	downstreamClient := downstreamStrategy.GetClient()
 
+	// TODO(jreese) handle workload / workload deployment scoped resources.
+	// Do this by creating CRDs to manage them.
+
 	runtime := instance.Spec.Runtime
 	if runtime.Sandbox != nil {
 		return r.reconcileSandboxRuntimeInstance(
@@ -192,8 +199,6 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	return ctrl.Result{}, nil
 }
 
-// TODO(jreese) Audit for workload-scoped but regional resources, make sure
-// the k8s entity names are unique across regions.
 func (r *InstanceReconciler) reconcileInstance(
 	ctx context.Context,
 	clusterName string,
@@ -207,6 +212,21 @@ func (r *InstanceReconciler) reconcileInstance(
 	cloudConfig *cloudinit.CloudConfig,
 	instanceMetadata map[string]*string,
 ) (res ctrl.Result, err error) {
+
+	if location.Spec.Provider.AWS != nil {
+		return r.awsInstanceReconciler.Reconcile(
+			ctx,
+			downstreamStrategy,
+			downstreamClient,
+			strings.TrimPrefix(clusterName, "/"),
+			location,
+			*workload,
+			*workloadDeployment,
+			*instance,
+			cloudConfig,
+		)
+	}
+
 	logger := log.FromContext(ctx)
 
 	programmedCondition := metav1.Condition{
@@ -2252,8 +2272,9 @@ func (r *InstanceReconciler) Finalize(
 // SetupWithManager sets up the controller with the Manager.
 func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
+	r.awsInstanceReconciler = aws.NewInstanceReconciler()
 
-	return mcbuilder.ControllerManagedBy(mgr).
+	builder := mcbuilder.ControllerManagedBy(mgr).
 		For(&computev1alpha.Instance{}).
 		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpcloudplatformv1beta1.ServiceAccount](mgr))).
 		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta2.Secret](mgr))).
@@ -2310,6 +2331,11 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 				}
 			})
 		})).
-		Named("instance").
-		Complete(r)
+		Named("instance")
+
+	if err := r.awsInstanceReconciler.RegisterWatches(builder); err != nil {
+		return err
+	}
+
+	return builder.Complete(r)
 }
