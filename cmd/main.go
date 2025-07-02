@@ -39,10 +39,10 @@ import (
 
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller"
-	"go.datum.net/infra-provider-gcp/internal/providers"
-	mcdatum "go.datum.net/infra-provider-gcp/internal/providers/datum"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
+	mcproviders "go.miloapis.com/milo/pkg/multicluster-runtime"
+	mcmilo "go.miloapis.com/milo/pkg/multicluster-runtime/milo"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -297,13 +297,13 @@ func initializeClusterDiscovery(
 ) (runnables []manager.Runnable, provider runnableProvider, err error) {
 	runnables = append(runnables, deploymentCluster)
 	switch serverConfig.Discovery.Mode {
-	case providers.ProviderSingle:
+	case mcproviders.ProviderSingle:
 		provider = &wrappedSingleClusterProvider{
 			Provider: mcsingle.New("single", deploymentCluster),
 			cluster:  deploymentCluster,
 		}
 
-	case providers.ProviderDatum:
+	case mcproviders.ProviderMilo:
 		discoveryRestConfig, err := serverConfig.Discovery.DiscoveryRestConfig()
 		if err != nil {
 			return nil, nil, fmt.Errorf("unable to get discovery rest config: %w", err)
@@ -325,7 +325,7 @@ func initializeClusterDiscovery(
 			return nil, nil, fmt.Errorf("unable to set up overall controller manager: %w", err)
 		}
 
-		provider, err = mcdatum.New(discoveryManager, mcdatum.Options{
+		provider, err = mcmilo.New(discoveryManager, mcmilo.Options{
 			ClusterOptions: []cluster.Option{
 				func(o *cluster.Options) {
 					o.Scheme = scheme

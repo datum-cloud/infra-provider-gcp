@@ -256,6 +256,10 @@ go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae h1:D
 go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae/go.mod h1:uloVfxqE+8DgSiMB651X8UC9yECpXbwp/NBstofCceE=
 go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50 h1:b64nFXzX5ZWz7M4PtZV4vkZBmTS7BRJBiGYsr2ybhAY=
 go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50/go.mod h1:saBUHORJ1tkK4vFG2dhiTfvLiElLDtsQHaOxV43Drxc=
+go.miloapis.com/milo v0.0.0-20250626211327-1b06937505c9 h1:ynVlbeY6bSvtd1tlKN0oIIha/cYf34Yd7kRJdP356IM=
+go.miloapis.com/milo v0.0.0-20250626211327-1b06937505c9/go.mod h1:hh74+itTatDKu88z8rOItbrn3g98jei7ecaMKjJpFds=
+go.miloapis.com/milo v0.0.0-20250702165727-c016b9f5d66c h1:zk71USvsNLPFlh6jKzgeMNONqdbUl/tWUAhn0wlC2zs=
+go.miloapis.com/milo v0.0.0-20250702165727-c016b9f5d66c/go.mod h1:hh74+itTatDKu88z8rOItbrn3g98jei7ecaMKjJpFds=
 go.opentelemetry.io/auto/sdk v1.1.0 h1:cH53jehLUN6UFLY71z+NDOiNJqDdPRaXzTel0sJySYA=
 go.opentelemetry.io/auto/sdk v1.1.0/go.mod h1:3wSPjt5PWp2RhlCcmmOial7AvC4DQqZb7a7wCow3W8A=
 go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.55.0 h1:ZIg3ZT/aQ7AfKqdwp7ECpOK6vHqquXXuyTjIO8ZdmPs=

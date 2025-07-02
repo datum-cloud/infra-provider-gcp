@@ -20,7 +20,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"go.datum.net/infra-provider-gcp/internal/providers"
+	mcproviders "go.miloapis.com/milo/pkg/multicluster-runtime"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -257,7 +257,7 @@ type ProviderConfigStrategy struct {
 
 func (c *GCPProvider) GetProviderConfigName(clusterName string) string {
 	switch c.Discovery.Mode {
-	case providers.ProviderSingle:
+	case mcproviders.ProviderSingle:
 		if c.DownstreamResourceManagement.ProviderConfigStrategy.Single.Name == "" {
 			panic("single provider config strategy name is required")
 		}
@@ -298,7 +298,7 @@ type DiscoveryConfig struct {
 	// Mode is the mode that the operator should use to discover clusters.
 	//
 	// +default="single"
-	Mode providers.Provider `json:"mode"`
+	Mode mcproviders.Provider `json:"mode"`
 
 	// InternalServiceDiscovery will result in the operator to connect to internal
 	// service addresses for projects.

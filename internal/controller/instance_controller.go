@@ -45,9 +45,9 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
-	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
+	milosource "go.miloapis.com/milo/pkg/multicluster-runtime/source"
 )
 
 const crossplaneFinalizer = "finalizer.managedresource.crossplane.io"
@@ -306,7 +306,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		// TODO(jreese) should we only pass this through for locations in the same
 		// datum project (cluster for multicluster-runtime) as the instance?
 		programmedCondition.Message = fmt.Sprintf("Service account failed to create: %s", condition.Message)
-		return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
+		return ctrl.Result{}, errors.New(programmedCondition.Message)
 	}
 
 	// TODO(jreese) add IAM Policy to the GCP service account to allow the service
@@ -1612,10 +1612,10 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&computev1alpha.Instance{}).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpcloudplatformv1beta1.ServiceAccount](mgr))).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta2.Secret](mgr))).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta1.SecretVersion](mgr))).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Instance, mcreconcile.Request] {
+		WatchesRawSource(milosource.MustNewClusterSource(r.DownstreamCluster, &gcpcloudplatformv1beta1.ServiceAccount{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpcloudplatformv1beta1.ServiceAccount](mgr))).
+		WatchesRawSource(milosource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta2.Secret{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta2.Secret](mgr))).
+		WatchesRawSource(milosource.MustNewClusterSource(r.DownstreamCluster, &gcpsecretmanagerv1beta1.SecretVersion{}, datumhandler.EnqueueInstancesForWorkloadOwnedDownstreamResource[*gcpsecretmanagerv1beta1.SecretVersion](mgr))).
+		WatchesRawSource(milosource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Instance, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *gcpcomputev1beta2.Instance) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 

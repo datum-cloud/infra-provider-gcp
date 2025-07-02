@@ -30,8 +30,8 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
-	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
+	milosource "go.miloapis.com/milo/pkg/multicluster-runtime/source"
 )
 
 // NetworkContextReconciler reconciles a NetworkContext and ensures that a GCP
@@ -173,7 +173,7 @@ func (r *NetworkContextReconciler) Reconcile(ctx context.Context, req mcreconcil
 		logger.Info("network failed to create")
 		programmedCondition.Reason = "NetworkFailedToCreate"
 		programmedCondition.Message = fmt.Sprintf("Network failed to create: %s", condition.Message)
-		return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
+		return ctrl.Result{}, errors.New(programmedCondition.Message)
 	}
 
 	if downstreamNetwork.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
@@ -199,7 +199,7 @@ func (r *NetworkContextReconciler) SetupWithManager(mgr mcmanager.Manager) error
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&networkingv1alpha.NetworkContext{}).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta1.Network{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta1.Network, mcreconcile.Request] {
+		WatchesRawSource(milosource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta1.Network{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta1.Network, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, network *gcpcomputev1beta1.Network) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 
