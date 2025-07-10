@@ -251,166 +251,164 @@ func (r *InstanceReconciler) reconcileInstance(
 		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
 	}
 
-	if location.Spec.Provider.GCP != nil {
-		// Service account names cannot exceed 30 characters
-		// TODO(jreese) move to base36, as the underlying bytes won't be lost
-		h := fnv.New32a()
-		h.Write([]byte(workload.UID))
+	// Service account names cannot exceed 30 characters
+	// TODO(jreese) move to base36, as the underlying bytes won't be lost
+	h := fnv.New32a()
+	h.Write([]byte(workload.UID))
 
-		// NOTE: This is garbage collected in the workload controller.
-		var serviceAccount gcpcloudplatformv1beta1.ServiceAccount
-		serviceAccountObjectKey := client.ObjectKey{
-			Name: fmt.Sprintf("workload-%s", workload.UID),
-		}
-		if err := downstreamStrategy.GetClient().Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("failed fetching workload's service account: %w", err)
-		}
+	// NOTE: This is garbage collected in the workload controller.
+	var serviceAccount gcpcloudplatformv1beta1.ServiceAccount
+	serviceAccountObjectKey := client.ObjectKey{
+		Name: fmt.Sprintf("workload-%s", workload.UID),
+	}
+	if err := downstreamStrategy.GetClient().Get(ctx, serviceAccountObjectKey, &serviceAccount); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching workload's service account: %w", err)
+	}
 
-		// NOTE: We do not wait for the service account to be ready, as the underlying
-		// Terraform provider has a `time.Sleep(10 * time.Second)` in the create path.
-		// See: https://github.com/hashicorp/terraform-provider-google/blob/092c36f3857a8ca0291dd3992f72357cabd45dc7/google/services/resourcemanager/resource_google_service_account.go#L181-L184
-		//
-		// In testing, the service account is created and ready in less than a second.
-		// In the case that it's not ready, the system will retry until it is.
-		//
-		// We do, however, wait for the Crossplane `AnnotationKeyExternalCreateSucceeded`
-		// annotation to show up, to ensure the action has been issued prior to trying
-		// to create the instance.
-		if serviceAccount.CreationTimestamp.IsZero() {
-			serviceAccount = gcpcloudplatformv1beta1.ServiceAccount{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: serviceAccountObjectKey.Name,
-					Annotations: map[string]string{
-						downstreamclient.UpstreamOwnerName:        workload.Name,
-						downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-						downstreamclient.UpstreamOwnerClusterName: clusterName,
-						crossplanemeta.AnnotationKeyExternalName:  fmt.Sprintf("workload-%d", h.Sum32()),
+	// NOTE: We do not wait for the service account to be ready, as the underlying
+	// Terraform provider has a `time.Sleep(10 * time.Second)` in the create path.
+	// See: https://github.com/hashicorp/terraform-provider-google/blob/092c36f3857a8ca0291dd3992f72357cabd45dc7/google/services/resourcemanager/resource_google_service_account.go#L181-L184
+	//
+	// In testing, the service account is created and ready in less than a second.
+	// In the case that it's not ready, the system will retry until it is.
+	//
+	// We do, however, wait for the Crossplane `AnnotationKeyExternalCreateSucceeded`
+	// annotation to show up, to ensure the action has been issued prior to trying
+	// to create the instance.
+	if serviceAccount.CreationTimestamp.IsZero() {
+		serviceAccount = gcpcloudplatformv1beta1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: serviceAccountObjectKey.Name,
+				Annotations: map[string]string{
+					downstreamclient.UpstreamOwnerName:        workload.Name,
+					downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
+					downstreamclient.UpstreamOwnerClusterName: clusterName,
+					crossplanemeta.AnnotationKeyExternalName:  fmt.Sprintf("workload-%d", h.Sum32()),
+				},
+				Labels: map[string]string{
+					computev1alpha.WorkloadUIDLabel: string(workload.UID),
+				},
+			},
+			Spec: gcpcloudplatformv1beta1.ServiceAccountSpec{
+				ResourceSpec: crossplanecommonv1.ResourceSpec{
+					ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+						crossplanecommonv1.ManagementActionAll,
 					},
-					Labels: map[string]string{
-						computev1alpha.WorkloadUIDLabel: string(workload.UID),
+					DeletionPolicy: crossplanecommonv1.DeletionDelete,
+					ProviderConfigReference: &crossplanecommonv1.Reference{
+						Name: r.Config.GetProviderConfigName("GCP", clusterName),
 					},
 				},
-				Spec: gcpcloudplatformv1beta1.ServiceAccountSpec{
-					ResourceSpec: crossplanecommonv1.ResourceSpec{
-						ManagementPolicies: crossplanecommonv1.ManagementPolicies{
-							crossplanecommonv1.ManagementActionAll,
-						},
-						DeletionPolicy: crossplanecommonv1.DeletionDelete,
-						ProviderConfigReference: &crossplanecommonv1.Reference{
-							Name: r.Config.GetProviderConfigName("GCP", clusterName),
-						},
-					},
-					ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
-						Project:     ptr.To(location.Spec.Provider.GCP.ProjectID),
-						Description: ptr.To(fmt.Sprintf("service account for workload %s", workload.UID)),
-					},
+				ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
+					Project:     ptr.To(location.Spec.Provider.GCP.ProjectID),
+					Description: ptr.To(fmt.Sprintf("service account for workload %s", workload.UID)),
 				},
-			}
-
-			if err := downstreamClient.Create(ctx, &serviceAccount); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create workload's service account: %w", err)
-			}
+			},
 		}
 
-		// TODO(jreese) use "Observe" mode resources to check on service account
-		// status. I've ran into a condition in testing where the service account
-		// was not found by the instance, which resulted in the create operation
-		// being rejected.
-
-		// See if there's been a failure to create the service account.
-		if condition := serviceAccount.Status.GetCondition("LastAsyncOperation"); condition.Reason == "AsyncCreateFailure" {
-			logger.Info("service account failed to create")
-			programmedCondition.Reason = "ServiceAccountFailedToCreate"
-			// TODO(jreese) should we only pass this through for locations in the same
-			// datum project (cluster for multicluster-runtime) as the instance?
-			programmedCondition.Message = fmt.Sprintf("Service account failed to create: %s", condition.Message)
-			return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
+		if err := downstreamClient.Create(ctx, &serviceAccount); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create workload's service account: %w", err)
 		}
+	}
 
-		// TODO(jreese) add IAM Policy to the GCP service account to allow the service
-		// account used by Crossplane the `roles/iam.serviceAccountUser` role,
-		// so that it can create instances with the service account without needing a
-		// project level role binding. Probably just pass in the service account
-		// email, otherwise we'd have to do some kind of discovery.
+	// TODO(jreese) use "Observe" mode resources to check on service account
+	// status. I've ran into a condition in testing where the service account
+	// was not found by the instance, which resulted in the create operation
+	// being rejected.
 
-		if hasAggregatedSecret {
-			proceed, err := r.reconcileGCPSecrets(
-				ctx,
-				clusterName,
-				location,
-				downstreamClient,
-				&programmedCondition,
-				cloudConfig,
-				workload,
-				aggregatedK8sSecret,
-				serviceAccount,
-			)
-			if !proceed || err != nil {
-				return ctrl.Result{}, err
-			}
-		}
+	// See if there's been a failure to create the service account.
+	if condition := serviceAccount.Status.GetCondition("LastAsyncOperation"); condition.Reason == "AsyncCreateFailure" {
+		logger.Info("service account failed to create")
+		programmedCondition.Reason = "ServiceAccountFailedToCreate"
+		// TODO(jreese) should we only pass this through for locations in the same
+		// datum project (cluster for multicluster-runtime) as the instance?
+		programmedCondition.Message = fmt.Sprintf("Service account failed to create: %s", condition.Message)
+		return ctrl.Result{}, fmt.Errorf(programmedCondition.Message)
+	}
 
-		// It's unlikely that we will hit this condition, as we wait for secrets
-		// above to be ready and return early if they are not. However, it's good to
-		// check.
-		if _, ok := serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalCreateSucceeded]; !ok {
-			logger.Info("service account not created yet", "service_account", serviceAccount.Name)
-			programmedCondition.Reason = "ProvisioningServiceAccount"
-			programmedCondition.Message = "Service account is being provisioned for the workload"
-			return ctrl.Result{}, nil
-		}
+	// TODO(jreese) add IAM Policy to the GCP service account to allow the service
+	// account used by Crossplane the `roles/iam.serviceAccountUser` role,
+	// so that it can create instances with the service account without needing a
+	// project level role binding. Probably just pass in the service account
+	// email, otherwise we'd have to do some kind of discovery.
 
-		gcpInstance, err := r.reconcileGCPInstance(
+	if hasAggregatedSecret {
+		proceed, err := r.reconcileGCPSecrets(
 			ctx,
 			clusterName,
-			upstreamClient,
-			downstreamClient,
 			location,
-			workload,
-			workloadDeployment,
-			instance,
+			downstreamClient,
+			&programmedCondition,
 			cloudConfig,
-			instanceMetadata,
+			workload,
+			aggregatedK8sSecret,
 			serviceAccount,
 		)
-		if err != nil {
+		if !proceed || err != nil {
 			return ctrl.Result{}, err
 		}
+	}
 
-		if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-			logger.Info("GCP instance not ready yet")
-			programmedCondition.Reason = "ProvisioningProviderInstance"
-			programmedCondition.Message = "GCP instance is being provisioned"
+	// It's unlikely that we will hit this condition, as we wait for secrets
+	// above to be ready and return early if they are not. However, it's good to
+	// check.
+	if _, ok := serviceAccount.Annotations[crossplanemeta.AnnotationKeyExternalCreateSucceeded]; !ok {
+		logger.Info("service account not created yet", "service_account", serviceAccount.Name)
+		programmedCondition.Reason = "ProvisioningServiceAccount"
+		programmedCondition.Message = "Service account is being provisioned for the workload"
+		return ctrl.Result{}, nil
+	}
 
-			return ctrl.Result{}, nil
+	gcpInstance, err := r.reconcileGCPInstance(
+		ctx,
+		clusterName,
+		upstreamClient,
+		downstreamClient,
+		location,
+		workload,
+		workloadDeployment,
+		instance,
+		cloudConfig,
+		instanceMetadata,
+		serviceAccount,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if gcpInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+		logger.Info("GCP instance not ready yet")
+		programmedCondition.Reason = "ProvisioningProviderInstance"
+		programmedCondition.Message = "GCP instance is being provisioned"
+
+		return ctrl.Result{}, nil
+	}
+
+	programmedCondition.Status = metav1.ConditionTrue
+	programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
+	programmedCondition.Message = "Instance has been programmed"
+	instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
+		ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
+	}
+
+	// TODO(jreese) remove when we have workload-operator define these
+	if len(instance.Status.NetworkInterfaces) == 0 {
+		instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(gcpInstance.Status.AtProvider.NetworkInterface))
+	}
+
+	for i, gcpNetworkInterface := range gcpInstance.Status.AtProvider.NetworkInterface {
+		interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
+		if gcpNetworkInterface.NetworkIP != nil {
+			interfaceStatus.Assignments.NetworkIP = gcpNetworkInterface.NetworkIP
 		}
 
-		programmedCondition.Status = metav1.ConditionTrue
-		programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
-		programmedCondition.Message = "Instance has been programmed"
-		instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
-			ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
-		}
-
-		// TODO(jreese) remove when we have workload-operator define these
-		if len(instance.Status.NetworkInterfaces) == 0 {
-			instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(gcpInstance.Status.AtProvider.NetworkInterface))
-		}
-
-		for i, gcpNetworkInterface := range gcpInstance.Status.AtProvider.NetworkInterface {
-			interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
-			if gcpNetworkInterface.NetworkIP != nil {
-				interfaceStatus.Assignments.NetworkIP = gcpNetworkInterface.NetworkIP
+		for _, accessConfig := range gcpNetworkInterface.AccessConfig {
+			if accessConfig.NATIP != nil {
+				interfaceStatus.Assignments.ExternalIP = accessConfig.NATIP
 			}
-
-			for _, accessConfig := range gcpNetworkInterface.AccessConfig {
-				if accessConfig.NATIP != nil {
-					interfaceStatus.Assignments.ExternalIP = accessConfig.NATIP
-				}
-			}
-
-			instance.Status.NetworkInterfaces[i] = interfaceStatus
 		}
+
+		instance.Status.NetworkInterfaces[i] = interfaceStatus
 	}
 
 	return ctrl.Result{}, nil
@@ -1432,108 +1430,107 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 	logger := log.FromContext(ctx)
 
 	for ruleIndex, ingressRule := range interfacePolicy.Ingress {
-		if location.Spec.Provider.GCP != nil {
-			// This could result in duplicate firewall rules if a workload that spans
-			// multiple contexts of the same network is created. This is considered
-			// ok for the time being, as the move to effective network policies for
-			// interfaces will address this.
-			//
-			// In addition, these will not be GCd until the workload is deleted,
-			firewallName := fmt.Sprintf("deployment-%s-net-%d-%d", workloadDeployment.UID, interfaceIndex, ruleIndex)
+		// This could result in duplicate firewall rules if a workload that spans
+		// multiple contexts of the same network is created. This is considered
+		// ok for the time being, as the move to effective network policies for
+		// interfaces will address this.
+		//
+		// In addition, these will not be GCd until the workload is deleted,
+		firewallName := fmt.Sprintf("deployment-%s-net-%d-%d", workloadDeployment.UID, interfaceIndex, ruleIndex)
 
-			var firewall gcpcomputev1beta2.Firewall
-			firewallObjectKey := client.ObjectKey{
-				Name: firewallName,
-			}
+		var firewall gcpcomputev1beta2.Firewall
+		firewallObjectKey := client.ObjectKey{
+			Name: firewallName,
+		}
 
-			if err := downstreamClient.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
-				return fmt.Errorf("failed to read firewall from k8s API: %w", err)
-			}
+		if err := downstreamClient.Get(ctx, firewallObjectKey, &firewall); client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("failed to read firewall from k8s API: %w", err)
+		}
 
-			if firewall.CreationTimestamp.IsZero() {
-				logger.Info("creating firewall for interface policy rule", "firewall_name", firewallName)
-				firewall = gcpcomputev1beta2.Firewall{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: firewallObjectKey.Name,
-						Labels: map[string]string{
-							computev1alpha.WorkloadUIDLabel:           string(workload.UID),
-							computev1alpha.WorkloadDeploymentUIDLabel: string(workloadDeployment.UID),
+		if firewall.CreationTimestamp.IsZero() {
+			logger.Info("creating firewall for interface policy rule", "firewall_name", firewallName)
+			firewall = gcpcomputev1beta2.Firewall{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: firewallObjectKey.Name,
+					Labels: map[string]string{
+						computev1alpha.WorkloadUIDLabel:           string(workload.UID),
+						computev1alpha.WorkloadDeploymentUIDLabel: string(workloadDeployment.UID),
+					},
+				},
+				Spec: gcpcomputev1beta2.FirewallSpec{
+					ResourceSpec: crossplanecommonv1.ResourceSpec{
+						ManagementPolicies: crossplanecommonv1.ManagementPolicies{
+							crossplanecommonv1.ManagementActionAll,
+						},
+						DeletionPolicy: crossplanecommonv1.DeletionDelete,
+						ProviderConfigReference: &crossplanecommonv1.Reference{
+							Name: r.Config.GetProviderConfigName("GCP", clusterName),
 						},
 					},
-					Spec: gcpcomputev1beta2.FirewallSpec{
-						ResourceSpec: crossplanecommonv1.ResourceSpec{
-							ManagementPolicies: crossplanecommonv1.ManagementPolicies{
-								crossplanecommonv1.ManagementActionAll,
-							},
-							DeletionPolicy: crossplanecommonv1.DeletionDelete,
-							ProviderConfigReference: &crossplanecommonv1.Reference{
-								Name: r.Config.GetProviderConfigName("GCP", clusterName),
-							},
+					ForProvider: gcpcomputev1beta2.FirewallParameters{
+						Project: ptr.To(location.Spec.Provider.GCP.ProjectID),
+						Description: ptr.To(fmt.Sprintf(
+							"instance interface policy for %s: interfaceIndex:%d, ruleIndex:%d",
+							workloadDeployment.Name,
+							interfaceIndex,
+							ruleIndex,
+						)),
+						Direction: ptr.To("INGRESS"),
+						NetworkRef: &crossplanecommonv1.Reference{
+							Name: fmt.Sprintf("network-%s", network.UID),
 						},
-						ForProvider: gcpcomputev1beta2.FirewallParameters{
-							Project: ptr.To(location.Spec.Provider.GCP.ProjectID),
-							Description: ptr.To(fmt.Sprintf(
-								"instance interface policy for %s: interfaceIndex:%d, ruleIndex:%d",
-								workloadDeployment.Name,
-								interfaceIndex,
-								ruleIndex,
-							)),
-							Direction: ptr.To("INGRESS"),
-							NetworkRef: &crossplanecommonv1.Reference{
-								Name: fmt.Sprintf("network-%s", network.UID),
-							},
-							Priority: ptr.To(float64(65534)),
-							TargetTags: []*string{
-								ptr.To(fmt.Sprintf("workload-%s", workload.UID)),
-								ptr.To(fmt.Sprintf("deployment-%s", workloadDeployment.UID)),
-							},
+						Priority: ptr.To(float64(65534)),
+						TargetTags: []*string{
+							ptr.To(fmt.Sprintf("workload-%s", workload.UID)),
+							ptr.To(fmt.Sprintf("deployment-%s", workloadDeployment.UID)),
 						},
 					},
+				},
+			}
+
+			for _, port := range ingressRule.Ports {
+				ipProtocol := "tcp"
+				if port.Protocol != nil {
+					ipProtocol = strings.ToLower(string(*port.Protocol))
 				}
 
-				for _, port := range ingressRule.Ports {
-					ipProtocol := "tcp"
-					if port.Protocol != nil {
-						ipProtocol = strings.ToLower(string(*port.Protocol))
+				var gcpPorts []*string
+				if port.Port != nil {
+					var gcpPort string
+
+					gcpPort = strconv.Itoa(port.Port.IntValue())
+					if gcpPort == "0" {
+						// TODO(jreese) look up named port
+						logger.Info("named port lookup not implemented")
+						return nil
 					}
 
-					var gcpPorts []*string
-					if port.Port != nil {
-						var gcpPort string
-
-						gcpPort = strconv.Itoa(port.Port.IntValue())
-						if gcpPort == "0" {
-							// TODO(jreese) look up named port
-							logger.Info("named port lookup not implemented")
-							return nil
-						}
-
-						if port.EndPort != nil {
-							gcpPort = fmt.Sprintf("%s-%d", gcpPort, *port.EndPort)
-						}
-
-						gcpPorts = append(gcpPorts, ptr.To(gcpPort))
+					if port.EndPort != nil {
+						gcpPort = fmt.Sprintf("%s-%d", gcpPort, *port.EndPort)
 					}
 
-					firewall.Spec.ForProvider.Allow = append(firewall.Spec.ForProvider.Allow, gcpcomputev1beta2.AllowParameters{
-						Protocol: ptr.To(ipProtocol),
-						Ports:    gcpPorts,
-					})
+					gcpPorts = append(gcpPorts, ptr.To(gcpPort))
 				}
 
-				for _, peer := range ingressRule.From {
-					if peer.IPBlock != nil {
-						firewall.Spec.ForProvider.SourceRanges = append(firewall.Spec.ForProvider.SourceRanges, ptr.To(peer.IPBlock.CIDR))
-						// TODO(jreese) implement IPBlock.Except as a separate rule of one higher priority
-					}
-				}
+				firewall.Spec.ForProvider.Allow = append(firewall.Spec.ForProvider.Allow, gcpcomputev1beta2.AllowParameters{
+					Protocol: ptr.To(ipProtocol),
+					Ports:    gcpPorts,
+				})
+			}
 
-				if err := downstreamClient.Create(ctx, &firewall); err != nil {
-					return fmt.Errorf("failed to create firewall: %w", err)
+			for _, peer := range ingressRule.From {
+				if peer.IPBlock != nil {
+					firewall.Spec.ForProvider.SourceRanges = append(firewall.Spec.ForProvider.SourceRanges, ptr.To(peer.IPBlock.CIDR))
+					// TODO(jreese) implement IPBlock.Except as a separate rule of one higher priority
 				}
+			}
+
+			if err := downstreamClient.Create(ctx, &firewall); err != nil {
+				return fmt.Errorf("failed to create firewall: %w", err)
 			}
 		}
 	}
+
 	return nil
 }
 
