@@ -4,18 +4,20 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -24,8 +26,10 @@ import (
 	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/providers"
+	"go.datum.net/infra-provider-gcp/internal/controller/providers/aws"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
+	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
@@ -35,7 +39,7 @@ type WorkloadDeploymentReconciler struct {
 	mgr               mcmanager.Manager
 	DownstreamCluster cluster.Cluster
 	LocationClassName string
-	Config            *config.GCPProvider
+	Config            config.GCPProvider
 
 	awsWorkloadDeploymentReconciler providers.WorkloadDeploymentReconciler
 }
@@ -94,16 +98,60 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 	)
 	downstreamClient := downstreamStrategy.GetClient()
 
+	var workload computev1alpha.Workload
+	workloadObjectKey := client.ObjectKey{
+		Namespace: workloadDeployment.Namespace,
+		Name:      workloadDeployment.Spec.WorkloadRef.Name,
+	}
+	if err := cl.GetClient().Get(ctx, workloadObjectKey, &workload); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching workload: %w", err)
+	}
+
+	// Ensure that a downstream workload exists for the provider
+	// "scope". In the case of AWS, that will be the ARN in the Location. For GCP,
+	// it will be the project name.
+	//
+	// We do this because a single workload may span multiple GCP projects or
+	// multiple AWS accounts, which each need their own workload scoped resources.
+	shaString := generateProviderScopeHash(*location)
+	downstreamWorkloadName := fmt.Sprintf("workload-%s-%s", workload.UID, shaString)
+
+	var downstreamWorkload infrav1alpha1.ClusterDownstreamWorkload
+	if err := downstreamClient.Get(ctx, client.ObjectKey{
+		Name: downstreamWorkloadName,
+	}, &downstreamWorkload); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching downstream workload: %w", err)
+	}
+
+	if downstreamWorkload.CreationTimestamp.IsZero() {
+		downstreamWorkload = infrav1alpha1.ClusterDownstreamWorkload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: downstreamWorkloadName,
+			},
+			Spec: infrav1alpha1.ClusterDownstreamWorkloadSpec{
+				WorkloadRef: infrav1alpha1.WorkloadRef{
+					UpstreamClusterName: req.ClusterName,
+					Namespace:           workload.Namespace,
+					Name:                workload.Name,
+				},
+			},
+		}
+
+		if err := downstreamClient.Create(ctx, &downstreamWorkload); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed creating downstream workload: %w", err)
+		}
+	}
+
 	// Ensure that the downstream workload deployment exists
 	var downstreamWorkloadDeployment infrav1alpha1.ClusterDownstreamWorkloadDeployment
 	if err := downstreamClient.Get(ctx, client.ObjectKey{
 		Name: fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
-	}, &downstreamWorkloadDeployment); err != nil {
+	}, &downstreamWorkloadDeployment); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching downstream workload deployment: %w", err)
 	}
 
 	if downstreamWorkloadDeployment.CreationTimestamp.IsZero() {
-		downstreamWorkloadDeployment := infrav1alpha1.ClusterDownstreamWorkloadDeployment{
+		downstreamWorkloadDeployment = infrav1alpha1.ClusterDownstreamWorkloadDeployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
 			},
@@ -121,27 +169,15 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 		}
 	}
 
-	var workload computev1alpha.Workload
-	workloadObjectKey := client.ObjectKey{
-		Namespace: workloadDeployment.Namespace,
-		Name:      workloadDeployment.Spec.WorkloadRef.Name,
+	aggregatedSecret, err := r.reconcileAggregatedSecret(ctx, cl.GetClient(), downstreamStrategy, &workloadDeployment, &downstreamWorkloadDeployment)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile aggregated secret: %w", err)
 	}
-	if err := cl.GetClient().Get(ctx, workloadObjectKey, &workload); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed fetching workload: %w", err)
-	}
-
-	// TODO(jreese)
-	//
-	// Ensure that a downstream workload exists for the provider
-	// "scope". In the case of AWS, that will be the ARN in the Location. For GCP,
-	// it will be the project name.
-	//
-	// We do this because a single workload may span multiple GCP projects or
-	// multiple AWS accounts, which each need their own workload scoped resources.
 
 	if location.Spec.Provider.AWS != nil {
-		return r.awsWorkloadDeploymentReconciler.Reconcile(
+		result, err := r.awsWorkloadDeploymentReconciler.Reconcile(
 			ctx,
+			cl.GetClient(),
 			downstreamStrategy,
 			downstreamClient,
 			req.ClusterName,
@@ -149,8 +185,31 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 			workload,
 			workloadDeployment,
 			downstreamWorkloadDeployment,
-			nil, // aggregatedK8sSecret,
+			aggregatedSecret,
 		)
+		if err != nil {
+			return result, err
+		} else if result.RequeueAfter > 0 {
+			return result, nil
+		}
+	}
+
+	if !apimeta.IsStatusConditionTrue(downstreamWorkload.Status.Conditions, "Ready") {
+		logger.Info("Downstream workload is not yet ready")
+		// TODO(jreese) add a watch
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	}
+
+	if apimeta.SetStatusCondition(&downstreamWorkloadDeployment.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: downstreamWorkloadDeployment.Generation,
+		Reason:             "Ready",
+		Message:            "Downstream resources have been reconciled",
+	}) {
+		if err := downstreamClient.Status().Update(ctx, &downstreamWorkloadDeployment); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed updating downstream workload status: %w", err)
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -160,23 +219,111 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
 
+	r.awsWorkloadDeploymentReconciler = aws.NewWorkloadDeploymentReconciler(r.Config)
+
 	return mcbuilder.ControllerManagedBy(mgr).
-		Watches(&infrav1alpha1.ClusterDownstreamWorkloadDeployment{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
-				downstreamWorkloadDeployment := obj.(*infrav1alpha1.ClusterDownstreamWorkloadDeployment)
-				return []mcreconcile.Request{
-					{
-						Request: reconcile.Request{
-							NamespacedName: types.NamespacedName{
-								Namespace: downstreamWorkloadDeployment.Spec.WorkloadDeploymentRef.Namespace,
-								Name:      downstreamWorkloadDeployment.Spec.WorkloadDeploymentRef.Name,
-							},
-						},
-						ClusterName: downstreamWorkloadDeployment.Spec.WorkloadDeploymentRef.UpstreamClusterName,
-					},
-				}
-			})
-		}).
+		For(&computev1alpha.WorkloadDeployment{}).
+		// TODO(jreese) this needs to watch the DownstreamCluster
+		// Watches(&infrav1alpha1.ClusterDownstreamWorkloadDeployment{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
+		// 	return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []mcreconcile.Request {
+		// 		downstreamWorkloadDeployment := obj.(*infrav1alpha1.ClusterDownstreamWorkloadDeployment)
+		// 		return []mcreconcile.Request{
+		// 			{
+		// 				Request: reconcile.Request{
+		// 					NamespacedName: types.NamespacedName{
+		// 						Namespace: downstreamWorkloadDeployment.Spec.WorkloadDeploymentRef.Namespace,
+		// 						Name:      downstreamWorkloadDeployment.Spec.WorkloadDeploymentRef.Name,
+		// 					},
+		// 				},
+		// 				ClusterName: downstreamWorkloadDeployment.Spec.WorkloadDeploymentRef.UpstreamClusterName,
+		// 			},
+		// 		}
+		// 	})
+		// }).
 		Named("workloaddeployment").
 		Complete(r)
+}
+
+// reconcileAggregatedSecret aggregates secret data into a single secret which
+// can be used to populate provider secret stores. A secret is created per
+// WorkloadDeployment instead of per Workload for ease of use.
+func (r *WorkloadDeploymentReconciler) reconcileAggregatedSecret(
+	ctx context.Context,
+	upstreamClient client.Client,
+	downstreamStrategy downstreamclient.ResourceStrategy,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+	downstreamWorklaodDeployment *infrav1alpha1.ClusterDownstreamWorkloadDeployment,
+) (*corev1.Secret, error) {
+	var objectKeys []client.ObjectKey
+	for _, volume := range workloadDeployment.Spec.Template.Spec.Volumes {
+		if volume.Secret != nil {
+			objectKeys = append(objectKeys, client.ObjectKey{
+				Namespace: workloadDeployment.Namespace,
+				Name:      volume.Secret.SecretName,
+			})
+		}
+	}
+
+	if len(objectKeys) == 0 {
+		return nil, nil
+	}
+
+	// Aggregate secret data into one value by creating a map of secret names
+	// to content. This will allow for mounting of keys into volumes or secrets
+	// as expected.
+	secretData := map[string]map[string][]byte{}
+	for _, objectKey := range objectKeys {
+		var k8ssecret corev1.Secret
+		if err := upstreamClient.Get(ctx, objectKey, &k8ssecret); err != nil {
+			return nil, fmt.Errorf("failed fetching secret: %w", err)
+		}
+
+		secretData[k8ssecret.Name] = k8ssecret.Data
+	}
+
+	secretBytes, err := json.Marshal(secretData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal secret data")
+	}
+
+	downstreamNamespaceName, err := downstreamStrategy.GetDownstreamNamespaceName(ctx, workloadDeployment)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get downstream namespace name: %w", err)
+	}
+
+	aggregatedK8sSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: downstreamNamespaceName,
+			Name:      fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
+		},
+	}
+
+	_, err = controllerutil.CreateOrUpdate(ctx, downstreamStrategy.GetClient(), aggregatedK8sSecret, func() error {
+		if err := controllerutil.SetControllerReference(downstreamWorklaodDeployment, aggregatedK8sSecret, r.DownstreamCluster.GetScheme()); err != nil {
+			return fmt.Errorf("failed to set controller reference on aggregated k8s secret: %w", err)
+		}
+
+		aggregatedK8sSecret.Data = map[string][]byte{
+			"secretData": secretBytes,
+		}
+
+		return nil
+	})
+
+	return nil, err
+}
+
+// generateProviderScopeHash generates a SHA256 hash based on the provider scope
+// For AWS, it uses the ARN; for GCP, it uses the project ID
+func generateProviderScopeHash(location networkingv1alpha.Location) string {
+	var scopeValue string
+
+	if location.Spec.Provider.AWS != nil {
+		scopeValue = location.Spec.Provider.AWS.RoleARN
+	} else if location.Spec.Provider.GCP != nil {
+		scopeValue = location.Spec.Provider.GCP.ProjectID
+	}
+
+	hash := sha256.Sum256([]byte(scopeValue))
+	return fmt.Sprintf("%x", hash)
 }

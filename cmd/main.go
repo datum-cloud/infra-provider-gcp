@@ -193,12 +193,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.WorkloadReconciler{
+	if err = (&controller.ClusterDownstreamWorkloadReconciler{
 		LocationClassName: serverConfig.LocationClassName,
 		DownstreamCluster: downstreamCluster,
 		Config:            &serverConfig,
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "WorkloadReconciler")
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterDownstreamWorkloadReconciler")
+		os.Exit(1)
+	}
+
+	if err = (&controller.WorkloadDeploymentReconciler{
+		Config:            serverConfig,
+		LocationClassName: serverConfig.LocationClassName,
+		DownstreamCluster: downstreamCluster,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WorkloadDeploymentReconciler")
 		os.Exit(1)
 	}
 

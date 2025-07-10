@@ -3,15 +3,14 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type ClusterDownstreamWorkloadSpec struct {
-	// WorkloadDeploymentRef is a reference to the workload deployment that this
+	// WorkloadRef is a reference to the workload that this
 	// downstream workload is associated with.
 	// +kubebuilder:validation:Required
-	WorkloadDeploymentRef WorkloadDeploymentRef `json:"workloadDeploymentRef"`
+	WorkloadRef WorkloadRef `json:"workloadRef"`
 }
 
 type WorkloadRef struct {
@@ -22,9 +21,13 @@ type WorkloadRef struct {
 
 type ClusterDownstreamWorkloadStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// ResourceRefs is a list of references to downstream resources managed by
-	// the workload.
-	ResourceRefs []corev1.ObjectReference `json:"resourceRefs,omitempty"`
+
+	AggregatedSecretRef *SecretReference `json:"aggregatedSecret,omitempty"`
+}
+
+type SecretReference struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
 }
 
 // +kubebuilder:object:root=true
@@ -38,7 +41,9 @@ type ClusterDownstreamWorkload struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ClusterDownstreamWorkloadSpec   `json:"spec,omitempty"`
+	Spec ClusterDownstreamWorkloadSpec `json:"spec,omitempty"`
+
+	// +kubebuilder:default={conditions:{{type:"Ready",status:"Unknown",reason:"Pending", message:"Waiting for controller", lastTransitionTime: "1970-01-01T00:00:00Z"}}}
 	Status ClusterDownstreamWorkloadStatus `json:"status,omitempty"`
 }
 

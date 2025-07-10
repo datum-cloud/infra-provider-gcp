@@ -62,6 +62,13 @@ spec:
             - workloadDeploymentRef
             type: object
           status:
+            default:
+              conditions:
+              - lastTransitionTime: "1970-01-01T00:00:00Z"
+                message: Waiting for controller
+                reason: Pending
+                status: Unknown
+                type: Ready
             properties:
               conditions:
                 items:

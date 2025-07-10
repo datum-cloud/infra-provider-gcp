@@ -4,6 +4,7 @@ import (
 	"context"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -20,6 +21,7 @@ import (
 type InstanceReconciler interface {
 	Reconcile(
 		ctx context.Context,
+		upstreamClient client.Client,
 		downstreamStrategy downstreamclient.ResourceStrategy,
 		downstreamClient client.Client,
 		clusterName string,
@@ -28,7 +30,8 @@ type InstanceReconciler interface {
 		workloadDeployment computev1alpha.WorkloadDeployment,
 		instance computev1alpha.Instance,
 		cloudConfig *cloudinit.CloudConfig,
-		aggregatedK8sSecret *corev1.Secret,
+		hasAggregatedSecret bool,
+		programmedCondition *metav1.Condition,
 	) (ctrl.Result, error)
 
 	RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error
@@ -37,6 +40,7 @@ type InstanceReconciler interface {
 type WorkloadDeploymentReconciler interface {
 	Reconcile(
 		ctx context.Context,
+		upstreamClient client.Client,
 		downstreamStrategy downstreamclient.ResourceStrategy,
 		downstreamClient client.Client,
 		clusterName string,

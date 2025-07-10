@@ -39,7 +39,9 @@ type ClusterDownstreamWorkloadDeployment struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ClusterDownstreamWorkloadDeploymentSpec   `json:"spec,omitempty"`
+	Spec ClusterDownstreamWorkloadDeploymentSpec `json:"spec,omitempty"`
+
+	// +kubebuilder:default={conditions:{{type:"Ready",status:"Unknown",reason:"Pending", message:"Waiting for controller", lastTransitionTime: "1970-01-01T00:00:00Z"}}}
 	Status ClusterDownstreamWorkloadDeploymentStatus `json:"status,omitempty"`
 }
 

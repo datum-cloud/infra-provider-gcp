@@ -18,13 +18,16 @@ import (
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/providers"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
-type workloadDeploymentReconciler struct{}
+type workloadDeploymentReconciler struct {
+	config config.GCPProvider
+}
 type workloadDeploymentReconcileContext struct {
 	providerConfigName  string
 	location            *networkingv1alpha.Location
@@ -39,12 +42,15 @@ type desiredWorkloadDeploymentResources struct {
 	securityGroupRules []awsec2v1beta1.SecurityGroupRule
 }
 
-func NewWorkloadDeploymentReconciler() providers.WorkloadDeploymentReconciler {
-	return &workloadDeploymentReconciler{}
+func NewWorkloadDeploymentReconciler(config config.GCPProvider) providers.WorkloadDeploymentReconciler {
+	return &workloadDeploymentReconciler{
+		config: config,
+	}
 }
 
 func (b *workloadDeploymentReconciler) Reconcile(
 	ctx context.Context,
+	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	clusterName string,
@@ -54,6 +60,77 @@ func (b *workloadDeploymentReconciler) Reconcile(
 	downstreamWorkloadDeployment infrav1alpha1.ClusterDownstreamWorkloadDeployment,
 	aggregatedK8sSecret *corev1.Secret,
 ) (ctrl.Result, error) {
+
+	// Resolve VPCs for each network interface
+	interfaceVPCs := make([]string, len(workloadDeployment.Spec.Template.Spec.NetworkInterfaces))
+	for interfaceIndex := range workloadDeployment.Spec.Template.Spec.NetworkInterfaces {
+		// 1. Fetch the NetworkBinding for the WorkloadDeployment
+		var networkBinding networkingv1alpha.NetworkBinding
+		networkBindingObjectKey := client.ObjectKey{
+			Namespace: workloadDeployment.Namespace,
+			Name:      fmt.Sprintf("%s-net-%d", workloadDeployment.Name, interfaceIndex),
+		}
+		if err := upstreamClient.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching network binding %s: %w", networkBindingObjectKey.Name, err)
+		}
+
+		// 2. Fetch the NetworkContext referenced by the NetworkBinding
+		var networkContext networkingv1alpha.NetworkContext
+		networkContextObjectKey := client.ObjectKey{
+			Namespace: networkBinding.Status.NetworkContextRef.Namespace,
+			Name:      networkBinding.Status.NetworkContextRef.Name,
+		}
+		if err := upstreamClient.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching network context %s/%s: %w", networkContextObjectKey.Namespace, networkContextObjectKey.Name, err)
+		}
+
+		// 4. Use the network context UID to create the downstream vpc reference
+		interfaceVPCs[interfaceIndex] = fmt.Sprintf("networkcontext-%s", networkContext.UID)
+	}
+
+	reconcileContext := &workloadDeploymentReconcileContext{
+		providerConfigName:  b.config.GetProviderConfigName("AWS", clusterName),
+		location:            &location,
+		workloadDeployment:  &workloadDeployment,
+		aggregatedK8sSecret: aggregatedK8sSecret,
+		interfaceVPCs:       interfaceVPCs,
+	}
+
+	desiredResources, err := b.collectDesiredResources(reconcileContext)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	for _, securityGroup := range desiredResources.securityGroups {
+		obj := &awsec2v1beta1.SecurityGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: securityGroup.Name,
+			},
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &workloadDeployment, func(obj *awsec2v1beta1.SecurityGroup) error {
+			obj.Spec = securityGroup.Spec
+			return nil
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create or patch security group %s: %w", securityGroup.Name, err)
+		}
+	}
+
+	for _, securityGroupRule := range desiredResources.securityGroupRules {
+		obj := &awsec2v1beta1.SecurityGroupRule{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: securityGroupRule.Name,
+			},
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &workloadDeployment, func(obj *awsec2v1beta1.SecurityGroupRule) error {
+			obj.Spec = securityGroupRule.Spec
+			return nil
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create or patch security group rule %s: %w", securityGroupRule.Name, err)
+		}
+	}
+
 	return ctrl.Result{}, nil
 }
 

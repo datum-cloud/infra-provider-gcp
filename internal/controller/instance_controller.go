@@ -4,7 +4,6 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -198,25 +197,7 @@ func (r *InstanceReconciler) reconcileInstance(
 	instanceMetadata map[string]*string,
 ) (res ctrl.Result, err error) {
 
-	aggregatedK8sSecret, hasAggregatedSecret, err := r.reconcileAggregatedSecret(ctx, upstreamClient, downstreamStrategy, downstreamClient, instance, workload)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed reconciling aggregated secret: %w", err)
-	}
-
-	if location.Spec.Provider.AWS != nil {
-		return r.awsInstanceReconciler.Reconcile(
-			ctx,
-			downstreamStrategy,
-			downstreamClient,
-			clusterName,
-			location,
-			*workload,
-			*workloadDeployment,
-			*instance,
-			cloudConfig,
-			aggregatedK8sSecret,
-		)
-	}
+	hasAggregatedSecret := r.hasAggregatedSecret(instance)
 
 	logger := log.FromContext(ctx)
 
@@ -233,6 +214,23 @@ func (r *InstanceReconciler) reconcileInstance(
 			err = errors.Join(err, upstreamClient.Status().Update(ctx, instance))
 		}
 	}()
+
+	if location.Spec.Provider.AWS != nil {
+		return r.awsInstanceReconciler.Reconcile(
+			ctx,
+			upstreamClient,
+			downstreamStrategy,
+			downstreamClient,
+			clusterName,
+			location,
+			*workload,
+			*workloadDeployment,
+			*instance,
+			cloudConfig,
+			hasAggregatedSecret,
+			&programmedCondition,
+		)
+	}
 
 	if err := r.reconcileNetworkInterfaces(
 		ctx,
@@ -337,11 +335,12 @@ func (r *InstanceReconciler) reconcileInstance(
 			ctx,
 			clusterName,
 			location,
+			downstreamStrategy,
 			downstreamClient,
 			&programmedCondition,
 			cloudConfig,
 			workload,
-			aggregatedK8sSecret,
+			hasAggregatedSecret,
 			serviceAccount,
 		)
 		if !proceed || err != nil {
@@ -742,19 +741,9 @@ func (r *InstanceReconciler) buildConfigMaps(
 	return nil
 }
 
-// reconcileAggregatedSecret aggregates secret data into a single secret which
-// can be used to populate provider secret stores.
-//
-// The second return value indicates whether or not secret material exists for
-// the workload.
-func (r *InstanceReconciler) reconcileAggregatedSecret(
-	ctx context.Context,
-	upstreamClient client.Client,
-	downstreamStrategy downstreamclient.ResourceStrategy,
-	downstreamClient client.Client,
+func (r *InstanceReconciler) hasAggregatedSecret(
 	instance *computev1alpha.Instance,
-	workload *computev1alpha.Workload,
-) (*corev1.Secret, bool, error) {
+) bool {
 	var objectKeys []client.ObjectKey
 	for _, volume := range instance.Spec.Volumes {
 		if volume.Secret != nil {
@@ -765,68 +754,19 @@ func (r *InstanceReconciler) reconcileAggregatedSecret(
 		}
 	}
 
-	if len(objectKeys) == 0 {
-		return nil, false, nil
-	}
-
-	// Aggregate secret data into one value by creating a map of secret names
-	// to content. This will allow for mounting of keys into volumes or secrets
-	// as expected.
-	secretData := map[string]map[string][]byte{}
-	for _, objectKey := range objectKeys {
-		var k8ssecret corev1.Secret
-		if err := upstreamClient.Get(ctx, objectKey, &k8ssecret); err != nil {
-			return nil, false, fmt.Errorf("failed fetching secret: %w", err)
-		}
-
-		secretData[k8ssecret.Name] = k8ssecret.Data
-	}
-
-	secretBytes, err := json.Marshal(secretData)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to marshal secret data")
-	}
-
-	downstreamNamespaceName, err := downstreamStrategy.GetDownstreamNamespaceName(ctx, instance)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to get downstream namespace name: %w", err)
-	}
-
-	// NOTE: This is garbage collected in the workload controller.
-	aggregatedK8sSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: downstreamNamespaceName,
-			Name:      fmt.Sprintf("workload-%s", workload.UID),
-		},
-	}
-	_, err = controllerutil.CreateOrUpdate(ctx, downstreamClient, aggregatedK8sSecret, func() error {
-		if err := downstreamStrategy.SetControllerReference(ctx, workload, aggregatedK8sSecret); err != nil {
-			return fmt.Errorf("failed to set owner reference on aggregated k8s secret: %w", err)
-		}
-
-		aggregatedK8sSecret.Data = map[string][]byte{
-			"secretData": secretBytes,
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to reconcile aggregated k8s secret: %w", err)
-	}
-
-	return aggregatedK8sSecret, true, nil
+	return len(objectKeys) != 0
 }
 
 func (r *InstanceReconciler) reconcileGCPSecrets(
 	ctx context.Context,
 	clusterName string,
 	location networkingv1alpha.Location,
+	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	programmedCondition *metav1.Condition,
 	cloudConfig *cloudinit.CloudConfig,
 	workload *computev1alpha.Workload,
-	aggregatedK8sSecret *corev1.Secret,
+	hasAggregatedSecret bool,
 	serviceAccount gcpcloudplatformv1beta1.ServiceAccount,
 ) (bool, error) {
 	logger := log.FromContext(ctx)
@@ -887,6 +827,11 @@ func (r *InstanceReconciler) reconcileGCPSecrets(
 		return false, nil
 	}
 
+	downstreamNamespaceName, err := downstreamStrategy.GetDownstreamNamespaceName(ctx, workload)
+	if err != nil {
+		return false, fmt.Errorf("failed to get downstream namespace name: %w", err)
+	}
+
 	// Store secret information in the secret version
 	// TODO(jreese) handle updates to secrets - this needs to be done by creating
 	// a new secret version.
@@ -933,8 +878,8 @@ func (r *InstanceReconciler) reconcileGCPSecrets(
 				SecretDataSecretRef: crossplanecommonv1.SecretKeySelector{
 					Key: "secretData",
 					SecretReference: crossplanecommonv1.SecretReference{
-						Name:      aggregatedK8sSecret.Name,
-						Namespace: aggregatedK8sSecret.Namespace,
+						Name:      fmt.Sprintf("workload-%s", workload.UID),
+						Namespace: downstreamNamespaceName,
 					},
 				},
 				SecretRef: &crossplanecommonv1.Reference{
@@ -1702,7 +1647,7 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		})).
 		Named("instance")
 
-	r.awsInstanceReconciler = aws.NewInstanceReconciler()
+	r.awsInstanceReconciler = aws.NewInstanceReconciler(r.Config)
 	if err := r.awsInstanceReconciler.RegisterWatches(r.DownstreamCluster, builder); err != nil {
 		return err
 	}

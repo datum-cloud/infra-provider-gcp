@@ -9,11 +9,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/utils/ptr"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
-func TestBuildInstance(t *testing.T) {
+func TestCollectDesiredResources(t *testing.T) {
 	workloadDeployment := &computev1alpha.WorkloadDeployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "my-container-workload-us-dfw",
@@ -51,7 +52,16 @@ func TestBuildInstance(t *testing.T) {
 		},
 	}
 
-	reconciler := NewInstanceReconciler().(*instanceReconciler)
+	testConfig := config.GCPProvider{
+		DownstreamResourceManagement: config.DownstreamResourceManagementConfig{
+			ProviderConfigStrategy: config.ProviderConfigStrategy{
+				Single: config.SingleProviderConfigStrategy{
+					AWSName: "test-aws-config",
+				},
+			},
+		},
+	}
+	reconciler := NewInstanceReconciler(testConfig).(*instanceReconciler)
 
 	reconcileContext := &instanceReconcileContext{
 		providerConfigName: "test-provider",

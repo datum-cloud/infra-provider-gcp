@@ -10,13 +10,13 @@ import (
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	awsec2v1beta1 "github.com/upbound/provider-aws/apis/ec2/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -25,6 +25,7 @@ import (
 
 	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/controller/providers"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
@@ -35,7 +36,9 @@ import (
 //go:embed bootstrap/populate_secrets_from_ssm.sh
 var awsPopulateSecretsScript string
 
-type instanceReconciler struct{}
+type instanceReconciler struct {
+	config config.GCPProvider
+}
 type instanceReconcileContext struct {
 	providerConfigName  string
 	location            *networkingv1alpha.Location
@@ -44,6 +47,8 @@ type instanceReconcileContext struct {
 	interfaceSubnets    []string
 	instanceProfileName string
 	userData            []byte
+	downstreamClient    client.Client
+	clusterName         string
 }
 
 type desiredInstanceResources struct {
@@ -52,12 +57,15 @@ type desiredInstanceResources struct {
 	instance          *awsec2v1beta1.Instance
 }
 
-func NewInstanceReconciler() providers.InstanceReconciler {
-	return &instanceReconciler{}
+func NewInstanceReconciler(config config.GCPProvider) providers.InstanceReconciler {
+	return &instanceReconciler{
+		config: config,
+	}
 }
 
 func (b *instanceReconciler) Reconcile(
 	ctx context.Context,
+	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	clusterName string,
@@ -66,14 +74,14 @@ func (b *instanceReconciler) Reconcile(
 	workloadDeployment computev1alpha.WorkloadDeployment,
 	instance computev1alpha.Instance,
 	cloudConfig *cloudinit.CloudConfig,
-	aggregatedK8sSecret *corev1.Secret,
+	hasAggregatedSecret bool,
+	programmedCondition *metav1.Condition,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
 	projectName := strings.TrimPrefix(clusterName, "/")
 
 	cloudConfig.AWSRegion = location.Spec.Provider.AWS.Region
-	cloudConfig.SecretsParameterName = fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID)
-
 	cloudConfig.Hostname = fmt.Sprintf("%s.%s.%s.cloud.datum-dns.net", instance.Name, instance.Namespace, projectName)
 
 	var userData []byte
@@ -87,7 +95,9 @@ func (b *instanceReconciler) Reconcile(
 		userData = append([]byte("#cloud-config\n\n"), cloudConfigBytes...)
 	} else if instance.Spec.Runtime.Sandbox != nil {
 
-		if aggregatedK8sSecret != nil {
+		if hasAggregatedSecret {
+			cloudConfig.SecretsParameterName = fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID)
+
 			cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
 				Encoding:    "b64",
 				Content:     base64.StdEncoding.EncodeToString([]byte(awsPopulateSecretsScript)),
@@ -109,8 +119,53 @@ func (b *instanceReconciler) Reconcile(
 		userData = ignitionConfigBytes
 	}
 
+	// Resolve subnets for each network interface
+	interfaceSubnets := make([]string, len(instance.Spec.NetworkInterfaces))
+	for interfaceIndex := range instance.Spec.NetworkInterfaces {
+		// 1. Fetch the NetworkBinding for the WorkloadDeployment
+		var networkBinding networkingv1alpha.NetworkBinding
+		networkBindingObjectKey := client.ObjectKey{
+			Namespace: instance.Namespace,
+			Name:      fmt.Sprintf("%s-net-%d", workloadDeployment.Name, interfaceIndex),
+		}
+		if err := upstreamClient.Get(ctx, networkBindingObjectKey, &networkBinding); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching network binding %s: %w", networkBindingObjectKey.Name, err)
+		}
+
+		// 2. Fetch the NetworkContext referenced by the NetworkBinding
+		var networkContext networkingv1alpha.NetworkContext
+		networkContextObjectKey := client.ObjectKey{
+			Namespace: networkBinding.Status.NetworkContextRef.Namespace,
+			Name:      networkBinding.Status.NetworkContextRef.Name,
+		}
+		if err := upstreamClient.Get(ctx, networkContextObjectKey, &networkContext); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching network context %s/%s: %w", networkContextObjectKey.Namespace, networkContextObjectKey.Name, err)
+		}
+
+		// 3. Fetch the Subnet in the same namespace as the NetworkContext
+		var subnet networkingv1alpha.Subnet
+		subnetObjectKey := client.ObjectKey{
+			Namespace: networkContext.Namespace,
+			Name:      fmt.Sprintf("%s-0", networkContext.Name),
+		}
+		if err := upstreamClient.Get(ctx, subnetObjectKey, &subnet); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching subnet %s/%s: %w", subnetObjectKey.Namespace, subnetObjectKey.Name, err)
+		}
+
+		// 4. Use the subnet UID to create the downstream subnet reference
+		interfaceSubnets[interfaceIndex] = fmt.Sprintf("subnet-%s", subnet.UID)
+	}
+
 	reconcileContext := &instanceReconcileContext{
-		userData: userData,
+		providerConfigName:  b.config.GetProviderConfigName("AWS", clusterName),
+		location:            &location,
+		workloadDeployment:  &workloadDeployment,
+		instance:            &instance,
+		interfaceSubnets:    interfaceSubnets,
+		instanceProfileName: fmt.Sprintf("workload-%s", workload.UID),
+		userData:            userData,
+		downstreamClient:    downstreamClient,
+		clusterName:         clusterName,
 	}
 
 	desiredResources, err := b.collectDesiredResources(reconcileContext)
@@ -118,95 +173,114 @@ func (b *instanceReconciler) Reconcile(
 		return ctrl.Result{}, err
 	}
 
-	// Create Network interfaces
-	for _, desiredInterface := range desiredResources.networkInterfaces {
-		networkInterface := desiredInterface.DeepCopy()
-		result, err := controllerutil.CreateOrUpdate(ctx, downstreamClient, networkInterface, func() error {
-
-			// TODO(jreese) add any necessary annotations/labels for use in watches
-			// desiredInterface.Annotations = networkInterface.Annotations
-			// desiredInterface.Labels = networkInterface.Labels
-
-			// TODO(jreese) make sure we don't clobber spec values that crossplane
-			// may be updating.
-			networkInterface.Spec = desiredInterface.Spec
-
+	for _, networkInterface := range desiredResources.networkInterfaces {
+		obj := &awsec2v1beta1.NetworkInterface{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: networkInterface.Name,
+			},
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &instance, func(obj *awsec2v1beta1.NetworkInterface) error {
+			obj.Spec = networkInterface.Spec
 			return nil
 		})
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed creating ENI: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to create or patch network interface %s: %w", networkInterface.Name, err)
 		}
-
-		logger.Info("processed ENI", "name", networkInterface.Name, "result", result)
 	}
 
-	/*
-		if awsInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-					logger.Info("AWS instance not ready yet")
-					programmedCondition.Reason = "ProvisioningProviderInstance"
-					programmedCondition.Message = "AWS instance is being provisioned"
+	for _, elasticIP := range desiredResources.elasticIPs {
+		obj := &awsec2v1beta1.EIP{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: elasticIP.Name,
+			},
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &instance, func(obj *awsec2v1beta1.EIP) error {
+			obj.Spec = elasticIP.Spec
+			return nil
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create or patch elastic IP %s: %w", elasticIP.Name, err)
+		}
+	}
 
-					return ctrl.Result{}, nil
-				}
+	obj := &awsec2v1beta1.Instance{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: desiredResources.instance.Name,
+		},
+	}
+	_, err = downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &instance, func(obj *awsec2v1beta1.Instance) error {
+		obj.Spec = desiredResources.instance.Spec
+		return nil
+	})
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create or patch instance %s: %w", desiredResources.instance.Name, err)
+	}
 
-				programmedCondition.Status = metav1.ConditionTrue
-				programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
-				programmedCondition.Message = "Instance has been programmed"
-				instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
-					ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
-				}
+	if desiredResources.instance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
+		logger.Info("AWS instance not ready yet")
+		programmedCondition.Reason = "ProvisioningProviderInstance"
+		programmedCondition.Message = "AWS instance is being provisioned"
 
-				if len(instance.Status.NetworkInterfaces) == 0 {
-					instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(instance.Spec.NetworkInterfaces))
-				}
+		return ctrl.Result{}, nil
+	}
 
-				for interfaceIndex := range instance.Spec.NetworkInterfaces {
-					var networkInterface awsec2v1beta1.NetworkInterface
-					networkInterfaceObjectKey := client.ObjectKey{
-						Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
-					}
-					if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
-						return ctrl.Result{}, fmt.Errorf("failed fetching network interface: %w", err)
-					}
+	programmedCondition.Status = metav1.ConditionTrue
+	programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
+	programmedCondition.Message = "Instance has been programmed"
+	instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
+		ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
+	}
 
-					interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
-					interfaceStatus.Assignments.NetworkIP = networkInterface.Status.AtProvider.PrivateIP
+	if len(instance.Status.NetworkInterfaces) == 0 {
+		instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(instance.Spec.NetworkInterfaces))
+	}
 
-					var publicIP awsec2v1beta1.EIP
-					publicIPObjectKey := client.ObjectKey{
-						Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
-					}
-					if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
-						return ctrl.Result{}, fmt.Errorf("failed fetching public IP: %w", err)
-					}
+	for interfaceIndex := range instance.Spec.NetworkInterfaces {
+		var networkInterface awsec2v1beta1.NetworkInterface
+		networkInterfaceObjectKey := client.ObjectKey{
+			Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
+		}
+		if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching network interface: %w", err)
+		}
 
-					if !publicIP.CreationTimestamp.IsZero() {
-						interfaceStatus.Assignments.ExternalIP = publicIP.Status.AtProvider.PublicIP
-					}
+		interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
+		interfaceStatus.Assignments.NetworkIP = networkInterface.Status.AtProvider.PrivateIP
 
-					instance.Status.NetworkInterfaces[interfaceIndex] = interfaceStatus
-				}
+		var publicIP awsec2v1beta1.EIP
+		publicIPObjectKey := client.ObjectKey{
+			Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
+		}
+		if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
+			return ctrl.Result{}, fmt.Errorf("failed fetching public IP: %w", err)
+		}
 
-				runningCondition := metav1.Condition{
-					Type:               computev1alpha.InstanceRunning,
-					Status:             metav1.ConditionFalse,
-					ObservedGeneration: instance.Generation,
-					Reason:             computev1alpha.InstanceRunningReasonStopped,
-					Message:            "Instance is not running",
-				}
+		if !publicIP.CreationTimestamp.IsZero() {
+			interfaceStatus.Assignments.ExternalIP = publicIP.Status.AtProvider.PublicIP
+		}
 
-				if ptr.Deref(awsInstance.Status.AtProvider.InstanceState, "") == "running" {
-					runningCondition.Status = metav1.ConditionTrue
-					runningCondition.Reason = computev1alpha.InstanceRunningReasonRunning
-					runningCondition.Message = "Instance is running"
-				}
+		instance.Status.NetworkInterfaces[interfaceIndex] = interfaceStatus
+	}
 
-				if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
-					if err := upstreamClient.Status().Update(ctx, instance); err != nil {
-						return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
-					}
-				}
-	*/
+	runningCondition := metav1.Condition{
+		Type:               computev1alpha.InstanceRunning,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: instance.Generation,
+		Reason:             computev1alpha.InstanceRunningReasonStopped,
+		Message:            "Instance is not running",
+	}
+
+	if ptr.Deref(desiredResources.instance.Status.AtProvider.InstanceState, "") == "running" {
+		runningCondition.Status = metav1.ConditionTrue
+		runningCondition.Reason = computev1alpha.InstanceRunningReasonRunning
+		runningCondition.Message = "Instance is running"
+	}
+
+	if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
+		if err := upstreamClient.Status().Update(ctx, desiredResources.instance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
+		}
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -251,7 +325,7 @@ func (b *instanceReconciler) collectDesiredResources(
 		return nil, err
 	}
 
-	awsInstance := &awsec2v1beta1.Instance{
+	desiredResources.instance = &awsec2v1beta1.Instance{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("instance-%s", reconcileContext.instance.UID),
 		},
@@ -275,7 +349,7 @@ func (b *instanceReconciler) collectDesiredResources(
 	}
 
 	for interfaceIndex := range reconcileContext.instance.Spec.NetworkInterfaces {
-		awsInstance.Spec.ForProvider.NetworkInterface = append(awsInstance.Spec.ForProvider.NetworkInterface, awsec2v1beta1.InstanceNetworkInterfaceParameters{
+		desiredResources.instance.Spec.ForProvider.NetworkInterface = append(desiredResources.instance.Spec.ForProvider.NetworkInterface, awsec2v1beta1.InstanceNetworkInterfaceParameters{
 			NetworkCardIndex: ptr.To(float64(0)),
 			DeviceIndex:      ptr.To(float64(interfaceIndex)),
 			NetworkInterfaceIDRef: &crossplanecommonv1.Reference{
@@ -283,8 +357,6 @@ func (b *instanceReconciler) collectDesiredResources(
 			},
 		})
 	}
-
-	desiredResources.instance = awsInstance
 
 	return desiredResources, nil
 }
