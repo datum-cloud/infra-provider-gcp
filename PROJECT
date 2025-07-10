@@ -7,4 +7,20 @@ layout:
 - go.kubebuilder.io/v4
 projectName: infra-provider-gcp
 repo: go.datum.net/infra-provider-gcp
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: datumapis.com
+  group: infra
+  kind: DownstreamWorkloadDeployment
+  path: go.datum.net/infra-provider-gcp/api/v1alpha1
+  version: v1alpha1
+- api:
+    crdVersion: v1
+  domain: datumapis.com
+  group: infra
+  kind: ClusterDownstreamWorkload
+  path: go.datum.net/infra-provider-gcp/api/v1alpha1
+  version: v1alpha1
 version: "3"

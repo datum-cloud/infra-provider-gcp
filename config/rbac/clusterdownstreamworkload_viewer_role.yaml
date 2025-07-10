@@ -1,0 +1,29 @@
+# This rule is not used by the project infra-provider-gcp itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to infra.datumapis.com resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: infra-provider-gcp
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterdownstreamworkload-viewer-role
+rules:
+- apiGroups:
+  - infra.datumapis.com
+  resources:
+  - clusterdownstreamworkloads
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infra.datumapis.com
+  resources:
+  - clusterdownstreamworkloads/status
+  verbs:
+  - get

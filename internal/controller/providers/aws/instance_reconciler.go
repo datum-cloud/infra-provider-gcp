@@ -4,31 +4,42 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	awsec2v1beta1 "github.com/upbound/provider-aws/apis/ec2/v1beta1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	datumsource "go.datum.net/infra-provider-gcp/internal/source"
+
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
+	"go.datum.net/infra-provider-gcp/internal/controller/providers"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
-	"go.datum.net/infra-provider-gcp/internal/providers"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
+//go:embed bootstrap/populate_secrets_from_ssm.sh
+var awsPopulateSecretsScript string
+
 type instanceReconciler struct{}
-type reconcileContext struct {
+type instanceReconcileContext struct {
+	providerConfigName  string
+	location            *networkingv1alpha.Location
 	workloadDeployment  *computev1alpha.WorkloadDeployment
 	instance            *computev1alpha.Instance
-	location            *networkingv1alpha.Location
-	providerConfigName  string
 	interfaceSubnets    []string
 	instanceProfileName string
 	userData            []byte
@@ -40,7 +51,7 @@ type desiredInstanceResources struct {
 	instance          *awsec2v1beta1.Instance
 }
 
-func NewInstanceReconciler() providers.Reconciler {
+func NewInstanceReconciler() providers.InstanceReconciler {
 	return &instanceReconciler{}
 }
 
@@ -48,17 +59,19 @@ func (b *instanceReconciler) Reconcile(
 	ctx context.Context,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
-	projectName string,
+	clusterName string,
 	location networkingv1alpha.Location,
 	workload computev1alpha.Workload,
 	workloadDeployment computev1alpha.WorkloadDeployment,
 	instance computev1alpha.Instance,
 	cloudConfig *cloudinit.CloudConfig,
+	aggregatedK8sSecret *corev1.Secret,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	projectName := strings.TrimPrefix(clusterName, "/")
 
 	cloudConfig.AWSRegion = location.Spec.Provider.AWS.Region
-	cloudConfig.SecretsParameterName = "TODO" // Get from workload deployment scoped resource
+	cloudConfig.SecretsParameterName = fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID)
 
 	cloudConfig.Hostname = fmt.Sprintf("%s.%s.%s.cloud.datum-dns.net", instance.Name, instance.Namespace, projectName)
 
@@ -72,6 +85,17 @@ func (b *instanceReconciler) Reconcile(
 		}
 		userData = append([]byte("#cloud-config\n\n"), cloudConfigBytes...)
 	} else if instance.Spec.Runtime.Sandbox != nil {
+
+		if aggregatedK8sSecret != nil {
+			cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
+				Encoding:    "b64",
+				Content:     base64.StdEncoding.EncodeToString([]byte(awsPopulateSecretsScript)),
+				Owner:       "root:root",
+				Path:        "/etc/secrets/populate_secrets_from_ssm.sh",
+				Permissions: "0700",
+			})
+		}
+
 		butaneConfig, err := cloudConfig.ToButane()
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to convert cloud config to ignition: %w", err)
@@ -84,7 +108,7 @@ func (b *instanceReconciler) Reconcile(
 		userData = ignitionConfigBytes
 	}
 
-	reconcileContext := &reconcileContext{
+	reconcileContext := &instanceReconcileContext{
 		userData: userData,
 	}
 
@@ -186,14 +210,39 @@ func (b *instanceReconciler) Reconcile(
 	return ctrl.Result{}, nil
 }
 
-func (b *instanceReconciler) RegisterWatches(builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error {
-	// TODO(jreese) add watches for at least the AWS Instance, consider it for
-	// other resources if necessary to avoid backoffs.
+func (b *instanceReconciler) RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error {
+	builder.WatchesRawSource(datumsource.MustNewClusterSource(downstreamCluster, &awsec2v1beta1.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*awsec2v1beta1.Instance, mcreconcile.Request] {
+		return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *awsec2v1beta1.Instance) []mcreconcile.Request {
+			logger := log.FromContext(ctx)
+
+			upstreamClusterName := instance.Annotations[downstreamclient.UpstreamOwnerClusterName]
+			upstreamName := instance.Annotations[downstreamclient.UpstreamOwnerName]
+			upstreamNamespace := instance.Annotations[downstreamclient.UpstreamOwnerNamespace]
+
+			if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
+				logger.Info("AWS instance is missing upstream ownership metadata")
+				return nil
+			}
+
+			return []mcreconcile.Request{
+				{
+					Request: reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Namespace: upstreamNamespace,
+							Name:      upstreamName,
+						},
+					},
+					ClusterName: upstreamClusterName,
+				},
+			}
+		})
+	}))
+
 	return nil
 }
 
 func (b *instanceReconciler) collectDesiredResources(
-	reconcileContext *reconcileContext,
+	reconcileContext *instanceReconcileContext,
 ) (*desiredInstanceResources, error) {
 	desiredResources := &desiredInstanceResources{}
 
@@ -240,7 +289,7 @@ func (b *instanceReconciler) collectDesiredResources(
 }
 
 func (b *instanceReconciler) collectNetworkInterfaceResources(
-	reconcileContext *reconcileContext,
+	reconcileContext *instanceReconcileContext,
 	desiredResources *desiredInstanceResources,
 ) error {
 	networkInterfaceCount := len(reconcileContext.instance.Spec.NetworkInterfaces)

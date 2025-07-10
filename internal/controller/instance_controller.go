@@ -15,9 +15,6 @@ import (
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	crossplanemeta "github.com/crossplane/crossplane-runtime/pkg/meta"
-	awsec2v1beta1 "github.com/upbound/provider-aws/apis/ec2/v1beta1"
-	awsiamv1beta1 "github.com/upbound/provider-aws/apis/iam/v1beta1"
-	awsssmv1beta1 "github.com/upbound/provider-aws/apis/ssm/v1beta1"
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
@@ -45,13 +42,12 @@ import (
 
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
+	"go.datum.net/infra-provider-gcp/internal/controller/providers"
+	"go.datum.net/infra-provider-gcp/internal/controller/providers/aws"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
-	"go.datum.net/infra-provider-gcp/internal/providers"
-	"go.datum.net/infra-provider-gcp/internal/providers/aws"
 	datumsource "go.datum.net/infra-provider-gcp/internal/source"
-	"go.datum.net/infra-provider-gcp/internal/util/text"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -63,9 +59,6 @@ var errResourceIsDeleting = errors.New("resource is deleting")
 //go:embed cloudinit/populate_secrets.py
 var gcpPopulateSecretsScript string
 
-//go:embed cloudinit/populate_secrets_from_ssm.sh
-var awsPopulateSecretsScript string
-
 // InstanceReconciler reconciles Instances and manages their intended state in
 // GCP
 type InstanceReconciler struct {
@@ -74,7 +67,7 @@ type InstanceReconciler struct {
 	LocationClassName string
 	DownstreamCluster cluster.Cluster
 
-	awsInstanceReconciler providers.Reconciler
+	awsInstanceReconciler providers.InstanceReconciler
 }
 
 func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
@@ -145,15 +138,10 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return ctrl.Result{}, fmt.Errorf("failed fetching workload deployment: %w", err)
 	}
 
-	workloadRef := metav1.GetControllerOf(&workloadDeployment)
-	if workloadRef == nil {
-		return ctrl.Result{}, fmt.Errorf("workload deployment is not owned by a workload")
-	}
-
 	var workload computev1alpha.Workload
 	workloadObjectKey := client.ObjectKey{
-		Namespace: instance.Namespace,
-		Name:      workloadRef.Name,
+		Namespace: workloadDeployment.Namespace,
+		Name:      workloadDeployment.Spec.WorkloadRef.Name,
 	}
 	if err := cl.GetClient().Get(ctx, workloadObjectKey, &workload); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed fetching workload: %w", err)
@@ -166,9 +154,6 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
 	)
 	downstreamClient := downstreamStrategy.GetClient()
-
-	// TODO(jreese) handle workload / workload deployment scoped resources.
-	// Do this by creating CRDs to manage them.
 
 	runtime := instance.Spec.Runtime
 	if runtime.Sandbox != nil {
@@ -213,17 +198,23 @@ func (r *InstanceReconciler) reconcileInstance(
 	instanceMetadata map[string]*string,
 ) (res ctrl.Result, err error) {
 
+	aggregatedK8sSecret, hasAggregatedSecret, err := r.reconcileAggregatedSecret(ctx, upstreamClient, downstreamStrategy, downstreamClient, instance, workload)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed reconciling aggregated secret: %w", err)
+	}
+
 	if location.Spec.Provider.AWS != nil {
 		return r.awsInstanceReconciler.Reconcile(
 			ctx,
 			downstreamStrategy,
 			downstreamClient,
-			strings.TrimPrefix(clusterName, "/"),
+			clusterName,
 			location,
 			*workload,
 			*workloadDeployment,
 			*instance,
 			cloudConfig,
+			aggregatedK8sSecret,
 		)
 	}
 
@@ -258,11 +249,6 @@ func (r *InstanceReconciler) reconcileInstance(
 
 	if err := r.buildConfigMaps(ctx, upstreamClient, cloudConfig, instance); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
-	}
-
-	aggregatedK8sSecret, hasAggregatedSecret, err := r.reconcileAggregatedSecret(ctx, upstreamClient, downstreamStrategy, downstreamClient, instance, workload)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed reconciling aggregated secret: %w", err)
 	}
 
 	if location.Spec.Provider.GCP != nil {
@@ -424,264 +410,6 @@ func (r *InstanceReconciler) reconcileInstance(
 			}
 
 			instance.Status.NetworkInterfaces[i] = interfaceStatus
-		}
-	} else if location.Spec.Provider.AWS != nil {
-
-		var secretsParameter *awsssmv1beta1.Parameter
-		if hasAggregatedSecret {
-			param, proceed, err := r.reconcileAWSSecrets(
-				ctx,
-				clusterName,
-				location,
-				downstreamClient,
-				&programmedCondition,
-				cloudConfig,
-				workloadDeployment,
-				aggregatedK8sSecret,
-			)
-			if !proceed || err != nil {
-				return ctrl.Result{}, err
-			}
-
-			secretsParameter = param
-
-			cloudConfig.AWSRegion = location.Spec.Provider.AWS.Region
-			cloudConfig.SecretsParameterName = *secretsParameter.Status.AtProvider.ID
-		}
-
-		var instanceProfileRole awsiamv1beta1.Role
-		instanceProfileRoleObjectKey := client.ObjectKey{
-			Name: fmt.Sprintf("workload-%s", workload.UID),
-		}
-		if err := downstreamClient.Get(ctx, instanceProfileRoleObjectKey, &instanceProfileRole); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("failed fetching instance profile role: %w", err)
-		}
-
-		if instanceProfileRole.CreationTimestamp.IsZero() {
-			instanceProfileRole = awsiamv1beta1.Role{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: instanceProfileRoleObjectKey.Name,
-					Annotations: map[string]string{
-						downstreamclient.UpstreamOwnerName:        workload.Name,
-						downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-						downstreamclient.UpstreamOwnerClusterName: clusterName,
-					},
-				},
-				Spec: awsiamv1beta1.RoleSpec{
-					ResourceSpec: crossplanecommonv1.ResourceSpec{
-						ProviderConfigReference: &crossplanecommonv1.Reference{
-							Name: r.Config.GetProviderConfigName("AWS", clusterName),
-						},
-					},
-					ForProvider: awsiamv1beta1.RoleParameters{
-						AssumeRolePolicy: ptr.To(text.Dedent(`
-							{
-								"Version": "2012-10-17",
-								"Statement": [
-									{
-										"Effect": "Allow",
-										"Principal": {
-											"Service": "ec2.amazonaws.com"
-										},
-										"Action": "sts:AssumeRole"
-									}
-								]
-							}
-						`)),
-					},
-				},
-			}
-
-			if secretsParameter != nil {
-				instanceProfileRole.Spec.ForProvider.InlinePolicy = append(instanceProfileRole.Spec.ForProvider.InlinePolicy, awsiamv1beta1.InlinePolicyParameters{
-					Name: ptr.To("ssm-read"),
-					Policy: ptr.To(fmt.Sprintf(text.Dedent(`
-						{
-							"Version": "2012-10-17",
-							"Statement": [
-								{
-									"Effect": "Allow",
-									"Action": "ssm:GetParameter",
-									"Resource": "%s"
-								}
-							]
-						}
-					`),
-						*secretsParameter.Status.AtProvider.Arn,
-					)),
-				})
-			}
-
-			if err := downstreamClient.Create(ctx, &instanceProfileRole); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create instance profile role: %w", err)
-			}
-		}
-
-		var instanceProfile awsiamv1beta1.InstanceProfile
-		instanceProfileObjectKey := client.ObjectKey{
-			Name: fmt.Sprintf("workload-%s", workload.UID),
-		}
-		if err := downstreamClient.Get(ctx, instanceProfileObjectKey, &instanceProfile); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("failed fetching instance profile: %w", err)
-		}
-
-		if instanceProfile.CreationTimestamp.IsZero() {
-			instanceProfile = awsiamv1beta1.InstanceProfile{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: instanceProfileObjectKey.Name,
-					Annotations: map[string]string{
-						downstreamclient.UpstreamOwnerName:        workload.Name,
-						downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-						downstreamclient.UpstreamOwnerClusterName: clusterName,
-					},
-				},
-				Spec: awsiamv1beta1.InstanceProfileSpec{
-					ResourceSpec: crossplanecommonv1.ResourceSpec{
-						ProviderConfigReference: &crossplanecommonv1.Reference{
-							Name: r.Config.GetProviderConfigName("AWS", clusterName),
-						},
-					},
-					ForProvider: awsiamv1beta1.InstanceProfileParameters{
-						RoleRef: &crossplanecommonv1.Reference{
-							Name: instanceProfileRole.Name,
-						},
-					},
-				},
-			}
-
-			if err := downstreamClient.Create(ctx, &instanceProfile); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create instance profile: %w", err)
-			}
-		}
-
-		var awsInstance awsec2v1beta1.Instance
-		instanceObjectKey := client.ObjectKey{
-			Name: fmt.Sprintf("instance-%s", instance.UID),
-		}
-		if err := downstreamClient.Get(ctx, instanceObjectKey, &awsInstance); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, fmt.Errorf("failed fetching instance: %w", err)
-		}
-
-		if awsInstance.CreationTimestamp.IsZero() {
-			cloudConfig.Hostname = fmt.Sprintf("%s.%s.%s.cloud.datum-dns.net", instance.Name, instance.Namespace, strings.TrimPrefix(clusterName, "/"))
-			butaneConfig, err := cloudConfig.ToButane()
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to convert cloud config to ignition: %w", err)
-			}
-
-			ignitionConfigBytes, err := butaneConfig.ToIgnitionJSON()
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to generate ignition config: %w", err)
-			}
-
-			logger.Info("creating instance", "instance_name", instanceObjectKey.Name)
-			awsInstance = awsec2v1beta1.Instance{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: instanceObjectKey.Name,
-					Annotations: map[string]string{
-						downstreamclient.UpstreamOwnerName:        instance.Name,
-						downstreamclient.UpstreamOwnerNamespace:   instance.Namespace,
-						downstreamclient.UpstreamOwnerClusterName: clusterName,
-					},
-				},
-				Spec: awsec2v1beta1.InstanceSpec{
-					ResourceSpec: crossplanecommonv1.ResourceSpec{
-						ProviderConfigReference: &crossplanecommonv1.Reference{
-							Name: r.Config.GetProviderConfigName("AWS", clusterName),
-						},
-					},
-					ForProvider: awsec2v1beta1.InstanceParameters{
-						Region:           ptr.To(location.Spec.Provider.AWS.Region),
-						AvailabilityZone: ptr.To(location.Spec.Provider.AWS.Zone),
-						AMI:              ptr.To("ami-003496bc8140c472c"),
-						InstanceType:     ptr.To("t3a.micro"),
-						// TODO(jreese) remove
-						KeyName:            ptr.To("jreese@datum.net"),
-						IAMInstanceProfile: ptr.To(instanceProfile.Name),
-						UserDataBase64:     ptr.To(base64.StdEncoding.EncodeToString(ignitionConfigBytes)),
-					},
-				},
-			}
-
-			for interfaceIndex := range instance.Spec.NetworkInterfaces {
-				awsInstance.Spec.ForProvider.NetworkInterface = append(awsInstance.Spec.ForProvider.NetworkInterface, awsec2v1beta1.InstanceNetworkInterfaceParameters{
-					NetworkCardIndex: ptr.To(float64(0)),
-					DeviceIndex:      ptr.To(float64(interfaceIndex)),
-					NetworkInterfaceIDRef: &crossplanecommonv1.Reference{
-						Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
-					},
-				})
-			}
-
-			if err := downstreamClient.Create(ctx, &awsInstance); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to create instance: %w", err)
-			}
-		}
-
-		if awsInstance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-			logger.Info("AWS instance not ready yet")
-			programmedCondition.Reason = "ProvisioningProviderInstance"
-			programmedCondition.Message = "AWS instance is being provisioned"
-
-			return ctrl.Result{}, nil
-		}
-
-		programmedCondition.Status = metav1.ConditionTrue
-		programmedCondition.Reason = computev1alpha.InstanceProgrammedReasonProgrammed
-		programmedCondition.Message = "Instance has been programmed"
-		instance.Status.Controller = &computev1alpha.InstanceControllerStatus{
-			ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
-		}
-
-		if len(instance.Status.NetworkInterfaces) == 0 {
-			instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(instance.Spec.NetworkInterfaces))
-		}
-
-		for interfaceIndex := range instance.Spec.NetworkInterfaces {
-			var networkInterface awsec2v1beta1.NetworkInterface
-			networkInterfaceObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
-			}
-			if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
-				return ctrl.Result{}, fmt.Errorf("failed fetching network interface: %w", err)
-			}
-
-			interfaceStatus := computev1alpha.InstanceNetworkInterfaceStatus{}
-			interfaceStatus.Assignments.NetworkIP = networkInterface.Status.AtProvider.PrivateIP
-
-			var publicIP awsec2v1beta1.EIP
-			publicIPObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
-			}
-			if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
-				return ctrl.Result{}, fmt.Errorf("failed fetching public IP: %w", err)
-			}
-
-			if !publicIP.CreationTimestamp.IsZero() {
-				interfaceStatus.Assignments.ExternalIP = publicIP.Status.AtProvider.PublicIP
-			}
-
-			instance.Status.NetworkInterfaces[interfaceIndex] = interfaceStatus
-		}
-
-		runningCondition := metav1.Condition{
-			Type:               computev1alpha.InstanceRunning,
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: instance.Generation,
-			Reason:             computev1alpha.InstanceRunningReasonStopped,
-			Message:            "Instance is not running",
-		}
-
-		if ptr.Deref(awsInstance.Status.AtProvider.InstanceState, "") == "running" {
-			runningCondition.Status = metav1.ConditionTrue
-			runningCondition.Reason = computev1alpha.InstanceRunningReasonRunning
-			runningCondition.Message = "Instance is running"
-		}
-
-		if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
-			if err := upstreamClient.Status().Update(ctx, instance); err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
-			}
 		}
 	}
 
@@ -1090,83 +818,6 @@ func (r *InstanceReconciler) reconcileAggregatedSecret(
 	}
 
 	return aggregatedK8sSecret, true, nil
-}
-
-func (r *InstanceReconciler) reconcileAWSSecrets(
-	ctx context.Context,
-	clusterName string,
-	location networkingv1alpha.Location,
-	downstreamClient client.Client,
-	programmedCondition *metav1.Condition,
-	cloudConfig *cloudinit.CloudConfig,
-	workloadDeployment *computev1alpha.WorkloadDeployment,
-	aggregatedK8sSecret *corev1.Secret,
-) (*awsssmv1beta1.Parameter, bool, error) {
-	logger := log.FromContext(ctx)
-
-	var secretsParameter awsssmv1beta1.Parameter
-	secretsParameterObjectKey := client.ObjectKey{
-		Name: fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
-	}
-	if err := downstreamClient.Get(ctx, secretsParameterObjectKey, &secretsParameter); client.IgnoreNotFound(err) != nil {
-		return nil, false, fmt.Errorf("failed fetching secrets parameter: %w", err)
-	}
-
-	if secretsParameter.CreationTimestamp.IsZero() {
-		secretsParameter = awsssmv1beta1.Parameter{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: secretsParameterObjectKey.Name,
-				Annotations: map[string]string{
-					downstreamclient.UpstreamOwnerName:        workloadDeployment.Name,
-					downstreamclient.UpstreamOwnerNamespace:   workloadDeployment.Namespace,
-					downstreamclient.UpstreamOwnerClusterName: clusterName,
-				},
-			},
-			Spec: awsssmv1beta1.ParameterSpec{
-				ResourceSpec: crossplanecommonv1.ResourceSpec{
-					ProviderConfigReference: &crossplanecommonv1.Reference{
-						Name: r.Config.GetProviderConfigName("AWS", clusterName),
-					},
-				},
-				ForProvider: awsssmv1beta1.ParameterParameters_2{
-					Region:    ptr.To(location.Spec.Provider.AWS.Region),
-					Overwrite: ptr.To(true),
-					Type:      ptr.To("SecureString"),
-					ValueSecretRef: &crossplanecommonv1.SecretKeySelector{
-						SecretReference: crossplanecommonv1.SecretReference{
-							Namespace: aggregatedK8sSecret.Namespace,
-							Name:      aggregatedK8sSecret.Name,
-						},
-						Key: "secretData",
-					},
-				},
-			},
-		}
-
-		if err := downstreamClient.Create(ctx, &secretsParameter); err != nil {
-			return nil, false, fmt.Errorf("failed to create secrets parameter: %w", err)
-		}
-	}
-
-	if secretsParameter.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
-		logger.Info("secret not ready yet", "secret", secretsParameter.Name)
-		programmedCondition.Reason = "ProvisioningSecret"
-		programmedCondition.Message = "Secret is being provisioned for the workload"
-		return nil, false, nil
-	}
-
-	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
-		Encoding:    "b64",
-		Content:     base64.StdEncoding.EncodeToString([]byte(awsPopulateSecretsScript)),
-		Owner:       "root:root",
-		Path:        "/etc/secrets/populate_secrets_from_ssm.sh",
-		Permissions: "0700",
-	})
-
-	// TODO(jreese) updates? Do we need to hash the secret data and put an
-	// annotation on the parameter?
-
-	return &secretsParameter, true, nil
 }
 
 func (r *InstanceReconciler) reconcileGCPSecrets(
@@ -1715,7 +1366,6 @@ func (r *InstanceReconciler) reconcileNetworkInterfaces(
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
 ) error {
-	logger := log.FromContext(ctx)
 
 	for interfaceIndex, networkInterface := range workloadDeployment.Spec.Template.Spec.NetworkInterfaces {
 		interfacePolicy := networkInterface.NetworkPolicy
@@ -1749,192 +1399,6 @@ func (r *InstanceReconciler) reconcileNetworkInterfaces(
 		var network networkingv1alpha.Network
 		if err := upstreamClient.Get(ctx, client.ObjectKey{Namespace: networkContext.Namespace, Name: networkContext.Spec.Network.Name}, &network); err != nil {
 			return fmt.Errorf("failed to get network: %w", err)
-		}
-
-		if location.Spec.Provider.AWS != nil {
-			var securityGroup awsec2v1beta1.SecurityGroup
-			securityGroupObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("workloaddeployment-%s-net-%d", workloadDeployment.UID, interfaceIndex),
-			}
-			if err := downstreamClient.Get(ctx, securityGroupObjectKey, &securityGroup); client.IgnoreNotFound(err) != nil {
-				return fmt.Errorf("failed fetching security group: %w", err)
-			}
-
-			if securityGroup.CreationTimestamp.IsZero() {
-				logger.Info("creating security group for interface policy", "security_group_name", securityGroupObjectKey.Name)
-				securityGroup = awsec2v1beta1.SecurityGroup{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: securityGroupObjectKey.Name,
-						Annotations: map[string]string{
-							downstreamclient.UpstreamOwnerName:        workload.Name,
-							downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-							downstreamclient.UpstreamOwnerClusterName: clusterName,
-						},
-					},
-					Spec: awsec2v1beta1.SecurityGroupSpec{
-						ResourceSpec: crossplanecommonv1.ResourceSpec{
-							ProviderConfigReference: &crossplanecommonv1.Reference{
-								Name: r.Config.GetProviderConfigName("AWS", clusterName),
-							},
-						},
-						ForProvider: awsec2v1beta1.SecurityGroupParameters_2{
-							Region: ptr.To(location.Spec.Provider.AWS.Region),
-							VPCIDRef: &crossplanecommonv1.Reference{
-								Name: fmt.Sprintf("networkcontext-%s", networkContext.UID),
-							},
-						},
-					},
-				}
-
-				if err := downstreamClient.Create(ctx, &securityGroup); err != nil {
-					return fmt.Errorf("failed to create security group: %w", err)
-				}
-			}
-
-			var securityGroupEgressRule awsec2v1beta1.SecurityGroupRule
-			securityGroupEgressRuleObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("workloaddeployment-%s-net-%d-egress", workloadDeployment.UID, interfaceIndex),
-			}
-			if err := downstreamClient.Get(ctx, securityGroupEgressRuleObjectKey, &securityGroupEgressRule); client.IgnoreNotFound(err) != nil {
-				return fmt.Errorf("failed fetching security group egress rule: %w", err)
-			}
-
-			if securityGroupEgressRule.CreationTimestamp.IsZero() {
-				logger.Info("creating security group egress rule", "security_group_rule_name", securityGroupEgressRuleObjectKey.Name)
-				securityGroupEgressRule = awsec2v1beta1.SecurityGroupRule{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: securityGroupEgressRuleObjectKey.Name,
-						Annotations: map[string]string{
-							downstreamclient.UpstreamOwnerName:        workload.Name,
-							downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-							downstreamclient.UpstreamOwnerClusterName: clusterName,
-						},
-					},
-					Spec: awsec2v1beta1.SecurityGroupRuleSpec{
-						ResourceSpec: crossplanecommonv1.ResourceSpec{
-							ProviderConfigReference: &crossplanecommonv1.Reference{
-								Name: r.Config.GetProviderConfigName("AWS", clusterName),
-							},
-						},
-						ForProvider: awsec2v1beta1.SecurityGroupRuleParameters_2{
-							Region: ptr.To(location.Spec.Provider.AWS.Region),
-							SecurityGroupIDRef: &crossplanecommonv1.Reference{
-								Name: fmt.Sprintf("workloaddeployment-%s-net-%d", workloadDeployment.UID, interfaceIndex),
-							},
-							Type:     ptr.To("egress"),
-							Protocol: ptr.To("all"),
-							FromPort: ptr.To(float64(0)),
-							ToPort:   ptr.To(float64(65535)),
-							CidrBlocks: []*string{
-								ptr.To("0.0.0.0/0"),
-							},
-						},
-					},
-				}
-
-				if err := downstreamClient.Create(ctx, &securityGroupEgressRule); err != nil {
-					return fmt.Errorf("failed to create security group egress rule: %w", err)
-				}
-			}
-
-			var networkInterface awsec2v1beta1.NetworkInterface
-			networkInterfaceObjectKey := client.ObjectKey{
-				Name: fmt.Sprintf("instance-%s-net-%d", instance.UID, interfaceIndex),
-			}
-			if err := downstreamClient.Get(ctx, networkInterfaceObjectKey, &networkInterface); client.IgnoreNotFound(err) != nil {
-				return fmt.Errorf("failed fetching network interface: %w", err)
-			}
-
-			if networkInterface.CreationTimestamp.IsZero() {
-				// Fetch the first subnet in the network context
-				// TODO(jreese) have the workload-operator specify the subnet to use
-				// in the instance status before the Network gate is removed.
-				var subnet networkingv1alpha.Subnet
-				subnetObjectKey := client.ObjectKey{
-					Namespace: networkContext.Namespace,
-					Name:      fmt.Sprintf("%s-0", networkContext.Name),
-				}
-				if err := upstreamClient.Get(ctx, subnetObjectKey, &subnet); err != nil {
-					return fmt.Errorf("failed fetching subnet: %w", err)
-				}
-
-				logger.Info("creating network interface", "network_interface_name", networkInterfaceObjectKey.Name)
-				networkInterface = awsec2v1beta1.NetworkInterface{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: networkInterfaceObjectKey.Name,
-						Annotations: map[string]string{
-							downstreamclient.UpstreamOwnerName:        instance.Name,
-							downstreamclient.UpstreamOwnerNamespace:   instance.Namespace,
-							downstreamclient.UpstreamOwnerClusterName: clusterName,
-						},
-					},
-					Spec: awsec2v1beta1.NetworkInterfaceSpec{
-						ResourceSpec: crossplanecommonv1.ResourceSpec{
-							ProviderConfigReference: &crossplanecommonv1.Reference{
-								Name: r.Config.GetProviderConfigName("AWS", clusterName),
-							},
-						},
-						ForProvider: awsec2v1beta1.NetworkInterfaceParameters_2{
-							Region: ptr.To(location.Spec.Provider.AWS.Region),
-							SubnetIDRef: &crossplanecommonv1.Reference{
-								Name: fmt.Sprintf("subnet-%s", subnet.UID),
-							},
-							SecurityGroupRefs: []crossplanecommonv1.Reference{
-								{
-									Name: securityGroupObjectKey.Name,
-								},
-							},
-						},
-					},
-				}
-
-				if err := downstreamClient.Create(ctx, &networkInterface); err != nil {
-					return fmt.Errorf("failed to create network interface: %w", err)
-				}
-
-				if interfaceIndex == 0 {
-					var publicIP awsec2v1beta1.EIP
-					publicIPObjectKey := client.ObjectKey{
-						Name: fmt.Sprintf("instance-%s-net-%d-public-ip", instance.UID, interfaceIndex),
-					}
-					if err := downstreamClient.Get(ctx, publicIPObjectKey, &publicIP); client.IgnoreNotFound(err) != nil {
-						return fmt.Errorf("failed fetching public IP: %w", err)
-					}
-
-					if publicIP.CreationTimestamp.IsZero() {
-						logger.Info("creating public IP", "public_ip_name", publicIPObjectKey.Name)
-						publicIP = awsec2v1beta1.EIP{
-							ObjectMeta: metav1.ObjectMeta{
-								Name: publicIPObjectKey.Name,
-								Annotations: map[string]string{
-									downstreamclient.UpstreamOwnerName:        instance.Name,
-									downstreamclient.UpstreamOwnerNamespace:   instance.Namespace,
-									downstreamclient.UpstreamOwnerClusterName: clusterName,
-								},
-							},
-							Spec: awsec2v1beta1.EIPSpec{
-								ResourceSpec: crossplanecommonv1.ResourceSpec{
-									ProviderConfigReference: &crossplanecommonv1.Reference{
-										Name: r.Config.GetProviderConfigName("AWS", clusterName),
-									},
-								},
-								ForProvider: awsec2v1beta1.EIPParameters{
-									Region: ptr.To(location.Spec.Provider.AWS.Region),
-									Domain: ptr.To("vpc"),
-									NetworkInterfaceRef: &crossplanecommonv1.Reference{
-										Name: networkInterfaceObjectKey.Name,
-									},
-								},
-							},
-						}
-
-						if err := downstreamClient.Create(ctx, &publicIP); err != nil {
-							return fmt.Errorf("failed to create public IP: %w", err)
-						}
-					}
-				}
-			}
-
 		}
 
 		if err := r.reconcileNetworkInterfaceNetworkPolicies(
@@ -2066,71 +1530,6 @@ func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 
 				if err := downstreamClient.Create(ctx, &firewall); err != nil {
 					return fmt.Errorf("failed to create firewall: %w", err)
-				}
-			}
-		} else if location.Spec.Provider.AWS != nil {
-			for portIndex, port := range ingressRule.Ports {
-				if port.Port == nil {
-					logger.Info("skipping interface policy rule with no port", "rule_index", ruleIndex, "port_index", portIndex)
-					continue
-				}
-
-				ipProtocol := "tcp"
-				if port.Protocol != nil {
-					ipProtocol = strings.ToLower(string(*port.Protocol))
-				}
-
-				var securityGroupRule awsec2v1beta1.SecurityGroupRule
-				securityGroupRuleObjectKey := client.ObjectKey{
-					Name: fmt.Sprintf("workloaddeployment-%s-net-%d-%d-%d", workloadDeployment.UID, interfaceIndex, ruleIndex, portIndex),
-				}
-				if err := downstreamClient.Get(ctx, securityGroupRuleObjectKey, &securityGroupRule); client.IgnoreNotFound(err) != nil {
-					return fmt.Errorf("failed fetching security group rule: %w", err)
-				}
-
-				if securityGroupRule.CreationTimestamp.IsZero() {
-					logger.Info("creating security group rule for interface policy rule", "security_group_rule_name", securityGroupRuleObjectKey.Name)
-					securityGroupRule = awsec2v1beta1.SecurityGroupRule{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: securityGroupRuleObjectKey.Name,
-							Annotations: map[string]string{
-								downstreamclient.UpstreamOwnerName:        workload.Name,
-								downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
-								downstreamclient.UpstreamOwnerClusterName: clusterName,
-							},
-						},
-						Spec: awsec2v1beta1.SecurityGroupRuleSpec{
-							ResourceSpec: crossplanecommonv1.ResourceSpec{
-								ProviderConfigReference: &crossplanecommonv1.Reference{
-									Name: r.Config.GetProviderConfigName("AWS", clusterName),
-								},
-							},
-							ForProvider: awsec2v1beta1.SecurityGroupRuleParameters_2{
-								Region: ptr.To(location.Spec.Provider.AWS.Region),
-								SecurityGroupIDRef: &crossplanecommonv1.Reference{
-									Name: fmt.Sprintf("workload-%s-net-%d", workload.UID, interfaceIndex),
-								},
-								Type:     ptr.To("ingress"),
-								Protocol: ptr.To(ipProtocol),
-								FromPort: ptr.To(float64(port.Port.IntValue())),
-								ToPort:   ptr.To(float64(port.Port.IntValue())),
-							},
-						},
-					}
-
-					if port.EndPort != nil {
-						securityGroupRule.Spec.ForProvider.ToPort = ptr.To(float64(*port.EndPort))
-					}
-
-					for _, peer := range ingressRule.From {
-						if peer.IPBlock != nil {
-							securityGroupRule.Spec.ForProvider.CidrBlocks = append(securityGroupRule.Spec.ForProvider.CidrBlocks, ptr.To(peer.IPBlock.CIDR))
-						}
-					}
-
-					if err := downstreamClient.Create(ctx, &securityGroupRule); err != nil {
-						return fmt.Errorf("failed to create security group rule: %w", err)
-					}
 				}
 			}
 		}
@@ -2272,7 +1671,6 @@ func (r *InstanceReconciler) Finalize(
 // SetupWithManager sets up the controller with the Manager.
 func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
-	r.awsInstanceReconciler = aws.NewInstanceReconciler()
 
 	builder := mcbuilder.ControllerManagedBy(mgr).
 		For(&computev1alpha.Instance{}).
@@ -2305,35 +1703,10 @@ func (r *InstanceReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 				}
 			})
 		})).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &awsec2v1beta1.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*awsec2v1beta1.Instance, mcreconcile.Request] {
-			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *awsec2v1beta1.Instance) []mcreconcile.Request {
-				logger := log.FromContext(ctx)
-
-				upstreamClusterName := instance.Annotations[downstreamclient.UpstreamOwnerClusterName]
-				upstreamName := instance.Annotations[downstreamclient.UpstreamOwnerName]
-				upstreamNamespace := instance.Annotations[downstreamclient.UpstreamOwnerNamespace]
-
-				if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
-					logger.Info("AWS instance is missing upstream ownership metadata")
-					return nil
-				}
-
-				return []mcreconcile.Request{
-					{
-						Request: reconcile.Request{
-							NamespacedName: types.NamespacedName{
-								Namespace: upstreamNamespace,
-								Name:      upstreamName,
-							},
-						},
-						ClusterName: upstreamClusterName,
-					},
-				}
-			})
-		})).
 		Named("instance")
 
-	if err := r.awsInstanceReconciler.RegisterWatches(builder); err != nil {
+	r.awsInstanceReconciler = aws.NewInstanceReconciler()
+	if err := r.awsInstanceReconciler.RegisterWatches(r.DownstreamCluster, builder); err != nil {
 		return err
 	}
 

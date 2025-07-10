@@ -40,12 +40,14 @@ import (
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcsingle "sigs.k8s.io/multicluster-runtime/providers/single"
 
+	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
+	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
+
+	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller"
 	"go.datum.net/infra-provider-gcp/internal/providers"
 	mcdatum "go.datum.net/infra-provider-gcp/internal/providers/datum"
-	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
-	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -74,6 +76,7 @@ func init() {
 	utilruntime.Must(gcpsecretmanagerv1beta1.AddToScheme(scheme))
 	utilruntime.Must(gcpsecretmanagerv1beta2.AddToScheme(scheme))
 
+	utilruntime.Must(infrav1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 

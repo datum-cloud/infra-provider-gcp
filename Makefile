@@ -45,6 +45,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd:generateEmbeddedObjectMeta=true webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./internal/controller/rbac/..." output:crd:artifacts:config=config/crd/bases
 	$(CONTROLLER_GEN) rbac:roleName=upstream-manager-role crd webhook paths="./internal/controller/rbac/upstream" output:rbac:artifacts:config=config/rbac_upstream
 	$(CONTROLLER_GEN) rbac:roleName=downstream-manager-role crd webhook paths="./internal/controller/rbac/downstream" output:rbac:artifacts:config=config/rbac_downstream

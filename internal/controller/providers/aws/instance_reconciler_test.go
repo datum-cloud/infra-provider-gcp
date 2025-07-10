@@ -53,17 +53,17 @@ func TestBuildInstance(t *testing.T) {
 
 	reconciler := NewInstanceReconciler().(*instanceReconciler)
 
-	reconcileContext := &reconcileContext{
-		workloadDeployment,
-		instance,
-		location,
-		"test-provider",
-		[]string{
+	reconcileContext := &instanceReconcileContext{
+		providerConfigName: "test-provider",
+		location:           location,
+		workloadDeployment: workloadDeployment,
+		instance:           instance,
+		interfaceSubnets: []string{
 			"test",
 			"test2",
 		},
-		"instanceprofile",
-		[]byte("userdata"),
+		instanceProfileName: "instanceprofile",
+		userData:            []byte("userdata"),
 	}
 
 	result, err := reconciler.collectDesiredResources(reconcileContext)
