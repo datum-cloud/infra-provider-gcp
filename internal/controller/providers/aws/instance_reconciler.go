@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	_ "embed"
 	"encoding/base64"
 	"fmt"
 	"strings"
