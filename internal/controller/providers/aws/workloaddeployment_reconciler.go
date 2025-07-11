@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
@@ -31,6 +32,7 @@ type workloadDeploymentReconciler struct {
 type workloadDeploymentReconcileContext struct {
 	providerConfigName  string
 	location            *networkingv1alpha.Location
+	workload            *computev1alpha.Workload
 	workloadDeployment  *computev1alpha.WorkloadDeployment
 	aggregatedK8sSecret *corev1.Secret
 	interfaceVPCs       []string
@@ -60,6 +62,7 @@ func (b *workloadDeploymentReconciler) Reconcile(
 	downstreamWorkloadDeployment infrav1alpha1.ClusterDownstreamWorkloadDeployment,
 	aggregatedK8sSecret *corev1.Secret,
 ) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
 	// Resolve VPCs for each network interface
 	interfaceVPCs := make([]string, len(workloadDeployment.Spec.Template.Spec.NetworkInterfaces))
@@ -91,6 +94,7 @@ func (b *workloadDeploymentReconciler) Reconcile(
 	reconcileContext := &workloadDeploymentReconcileContext{
 		providerConfigName:  b.config.GetProviderConfigName("AWS", clusterName),
 		location:            &location,
+		workload:            &workload,
 		workloadDeployment:  &workloadDeployment,
 		aggregatedK8sSecret: aggregatedK8sSecret,
 		interfaceVPCs:       interfaceVPCs,
@@ -101,31 +105,24 @@ func (b *workloadDeploymentReconciler) Reconcile(
 		return ctrl.Result{}, err
 	}
 
-	for _, securityGroup := range desiredResources.securityGroups {
-		obj := &awsec2v1beta1.SecurityGroup{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: securityGroup.Name,
-			},
+	if desiredResources.secretsParameter != nil {
+		result, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, desiredResources.secretsParameter, clusterName, &workloadDeployment, nil)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to create or patch ssm parameter %s: %w", desiredResources.secretsParameter.Name, err)
 		}
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &workloadDeployment, func(obj *awsec2v1beta1.SecurityGroup) error {
-			obj.Spec = securityGroup.Spec
-			return nil
-		})
+
+		logger.Info("processed SSM Parameter", "result", result)
+	}
+
+	for _, securityGroup := range desiredResources.securityGroups {
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, &securityGroup, clusterName, &workloadDeployment, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch security group %s: %w", securityGroup.Name, err)
 		}
 	}
 
 	for _, securityGroupRule := range desiredResources.securityGroupRules {
-		obj := &awsec2v1beta1.SecurityGroupRule{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: securityGroupRule.Name,
-			},
-		}
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &workloadDeployment, func(obj *awsec2v1beta1.SecurityGroupRule) error {
-			obj.Spec = securityGroupRule.Spec
-			return nil
-		})
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, &securityGroupRule, clusterName, &workloadDeployment, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch security group rule %s: %w", securityGroupRule.Name, err)
 		}
@@ -146,7 +143,7 @@ func (b *workloadDeploymentReconciler) collectDesiredResources(
 	if reconcileContext.aggregatedK8sSecret != nil {
 		desiredResources.secretsParameter = &awsssmv1beta1.Parameter{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: fmt.Sprintf("workloaddeployment-%s", reconcileContext.workloadDeployment.UID),
+				Name: fmt.Sprintf("workload-%s-%s", reconcileContext.workload.UID, reconcileContext.workloadDeployment.UID),
 			},
 			Spec: awsssmv1beta1.ParameterSpec{
 				ResourceSpec: crossplanecommonv1.ResourceSpec{

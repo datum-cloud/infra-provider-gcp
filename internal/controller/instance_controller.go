@@ -197,8 +197,6 @@ func (r *InstanceReconciler) reconcileInstance(
 	instanceMetadata map[string]*string,
 ) (res ctrl.Result, err error) {
 
-	hasAggregatedSecret := r.hasAggregatedSecret(instance)
-
 	logger := log.FromContext(ctx)
 
 	programmedCondition := metav1.Condition{
@@ -214,6 +212,12 @@ func (r *InstanceReconciler) reconcileInstance(
 			err = errors.Join(err, upstreamClient.Status().Update(ctx, instance))
 		}
 	}()
+
+	hasAggregatedSecret := r.hasAggregatedSecret(instance)
+
+	if err := r.buildConfigMaps(ctx, upstreamClient, cloudConfig, instance); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
+	}
 
 	if location.Spec.Provider.AWS != nil {
 		return r.awsInstanceReconciler.Reconcile(
@@ -243,10 +247,6 @@ func (r *InstanceReconciler) reconcileInstance(
 		instance,
 	); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed reconciling network interfaces: %w", err)
-	}
-
-	if err := r.buildConfigMaps(ctx, upstreamClient, cloudConfig, instance); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed reconciling configmaps: %w", err)
 	}
 
 	// Service account names cannot exceed 30 characters

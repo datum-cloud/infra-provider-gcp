@@ -18,6 +18,9 @@ import (
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
+// TODO(jreese) make a layer on top of this so that controllers don't need to
+// look at whether they're reconciling gcp vs aws vs other
+
 type InstanceReconciler interface {
 	Reconcile(
 		ctx context.Context,
@@ -60,7 +63,6 @@ type WorkloadReconciler interface {
 		downstreamStrategy downstreamclient.ResourceStrategy,
 		downstreamClient client.Client,
 		clusterName string,
-		location networkingv1alpha.Location,
 		workload computev1alpha.Workload,
 	) (ctrl.Result, error)
 

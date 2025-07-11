@@ -24,6 +24,9 @@ import (
 
 	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
 	"go.datum.net/infra-provider-gcp/internal/config"
+	"go.datum.net/infra-provider-gcp/internal/controller/providers"
+	"go.datum.net/infra-provider-gcp/internal/controller/providers/aws"
+	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -35,6 +38,8 @@ type ClusterDownstreamWorkloadReconciler struct {
 	DownstreamCluster cluster.Cluster
 	LocationClassName string
 	Config            *config.GCPProvider
+
+	awsWorkloadReconciler providers.WorkloadReconciler
 }
 
 func (r *ClusterDownstreamWorkloadReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (_ ctrl.Result, err error) {
@@ -137,7 +142,21 @@ func (r *ClusterDownstreamWorkloadReconciler) Reconcile(ctx context.Context, req
 		return ctrl.Result{}, fmt.Errorf("failed fetching upstream workload: %w", err)
 	}
 
-	// TODO(jreese) call underlying reconcilers
+	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
+		downstreamWorkload.Spec.WorkloadRef.UpstreamClusterName,
+		cl.GetClient(),
+		downstreamClient,
+		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
+	)
+
+	// TODO(jreese) add provider info into the ClusterDownstreamWorkload
+
+	result, err := r.awsWorkloadReconciler.Reconcile(ctx, downstreamStrategy, downstreamStrategy.GetClient(), downstreamWorkload.Spec.WorkloadRef.UpstreamClusterName, workload)
+	if err != nil {
+		return result, err
+	} else if result.RequeueAfter > 0 {
+		return result, nil
+	}
 
 	if apimeta.SetStatusCondition(&downstreamWorkload.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
@@ -158,6 +177,8 @@ func (r *ClusterDownstreamWorkloadReconciler) Reconcile(ctx context.Context, req
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterDownstreamWorkloadReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	r.mgr = mgr
+
+	r.awsWorkloadReconciler = aws.NewWorkloadReconciler(*r.Config)
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &infrav1alpha1.ClusterDownstreamWorkload{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*infrav1alpha1.ClusterDownstreamWorkload, mcreconcile.Request] {

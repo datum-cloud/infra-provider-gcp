@@ -14,17 +14,18 @@ import (
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/providers"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/util/text"
-	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
-type workloadReconciler struct{}
+type workloadReconciler struct {
+	config config.GCPProvider
+}
 type workloadReconcileContext struct {
 	providerConfigName string
-	location           *networkingv1alpha.Location
 	workload           *computev1alpha.Workload
 }
 
@@ -33,8 +34,10 @@ type desiredWorkloadResources struct {
 	instanceProfile        awsiamv1beta1.InstanceProfile
 }
 
-func NewWorkloadReconciler() providers.WorkloadReconciler {
-	return &workloadReconciler{}
+func NewWorkloadReconciler(config config.GCPProvider) providers.WorkloadReconciler {
+	return &workloadReconciler{
+		config: config,
+	}
 }
 
 func (b *workloadReconciler) Reconcile(
@@ -42,10 +45,31 @@ func (b *workloadReconciler) Reconcile(
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	clusterName string,
-	location networkingv1alpha.Location,
 	workload computev1alpha.Workload,
-
 ) (ctrl.Result, error) {
+
+	reconcileContext := &workloadReconcileContext{
+		// TODO(jreese) pass GCP project / AWS Role ARN info into the ClusterDownstreamWorkload
+		// So they can be used to locate the correct provider config.
+		providerConfigName: b.config.GetProviderConfigName("AWS", clusterName),
+		workload:           &workload,
+	}
+
+	desiredResources, err := b.collectDesiredResources(reconcileContext)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	_, err = downstreamclient.CreateOrPatch(ctx, downstreamClient, &desiredResources.instanceProfileIAMRole, "__downstream__", &workload, nil)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create or patch IAM role for instance profile %s: %w", desiredResources.instanceProfileIAMRole.Name, err)
+	}
+
+	_, err = downstreamclient.CreateOrPatch(ctx, downstreamClient, &desiredResources.instanceProfile, "__downstream__", &workload, nil)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create or patch instance profile %s: %w", desiredResources.instanceProfileIAMRole.Name, err)
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -93,7 +117,7 @@ func (b *workloadReconciler) collectDesiredResources(
 										{
 											"Effect": "Allow",
 											"Action": "ssm:GetParameter",
-											"Resource": "arn:aws:ssm:*:*:parameter/workload-%s"
+											"Resource": "arn:aws:ssm:*:*:parameter/workload-%s-*"
 										}
 									]
 								}

@@ -96,7 +96,8 @@ func (b *instanceReconciler) Reconcile(
 	} else if instance.Spec.Runtime.Sandbox != nil {
 
 		if hasAggregatedSecret {
-			cloudConfig.SecretsParameterName = fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID)
+			// TODO(jreese) obtain this value from the ClusterDownstreamWorkloadDeployment
+			cloudConfig.SecretsParameterName = fmt.Sprintf("workload-%s-%s", workload.UID, workloadDeployment.UID)
 
 			cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
 				Encoding:    "b64",
@@ -174,47 +175,30 @@ func (b *instanceReconciler) Reconcile(
 	}
 
 	for _, networkInterface := range desiredResources.networkInterfaces {
-		obj := &awsec2v1beta1.NetworkInterface{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: networkInterface.Name,
-			},
-		}
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &instance, func(obj *awsec2v1beta1.NetworkInterface) error {
-			obj.Spec = networkInterface.Spec
-			return nil
-		})
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, networkInterface, clusterName, &instance, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch network interface %s: %w", networkInterface.Name, err)
 		}
 	}
 
 	for _, elasticIP := range desiredResources.elasticIPs {
-		obj := &awsec2v1beta1.EIP{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: elasticIP.Name,
-			},
-		}
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &instance, func(obj *awsec2v1beta1.EIP) error {
-			obj.Spec = elasticIP.Spec
-			return nil
-		})
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, elasticIP, clusterName, &instance, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch elastic IP %s: %w", elasticIP.Name, err)
 		}
 	}
 
-	obj := &awsec2v1beta1.Instance{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: desiredResources.instance.Name,
-		},
-	}
-	_, err = downstreamclient.CreateOrPatch(ctx, downstreamClient, obj, clusterName, &instance, func(obj *awsec2v1beta1.Instance) error {
-		obj.Spec = desiredResources.instance.Spec
+	result, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, desiredResources.instance, clusterName, &instance, func(observed, desired *awsec2v1beta1.Instance) error {
+		for interfaceIndex, networkInterface := range observed.Spec.ForProvider.NetworkInterface {
+			desired.Spec.ForProvider.NetworkInterface[interfaceIndex].NetworkInterfaceID = networkInterface.NetworkInterfaceID
+		}
 		return nil
 	})
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to create or patch instance %s: %w", desiredResources.instance.Name, err)
 	}
+
+	logger.Info("processed AWS instance", "result", result)
 
 	if desiredResources.instance.Status.GetCondition(crossplanecommonv1.TypeReady).Status != corev1.ConditionTrue {
 		logger.Info("AWS instance not ready yet")
@@ -276,8 +260,8 @@ func (b *instanceReconciler) Reconcile(
 		runningCondition.Message = "Instance is running"
 	}
 
-	if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) {
-		if err := upstreamClient.Status().Update(ctx, desiredResources.instance); err != nil {
+	if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) || true {
+		if err := upstreamClient.Status().Update(ctx, &instance); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
 		}
 	}

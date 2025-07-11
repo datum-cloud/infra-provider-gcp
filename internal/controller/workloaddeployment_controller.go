@@ -310,7 +310,7 @@ func (r *WorkloadDeploymentReconciler) reconcileAggregatedSecret(
 		return nil
 	})
 
-	return nil, err
+	return aggregatedK8sSecret, err
 }
 
 // generateProviderScopeHash generates a SHA256 hash based on the provider scope

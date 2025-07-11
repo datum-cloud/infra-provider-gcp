@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/utils/ptr"
 
+	"go.datum.net/infra-provider-gcp/internal/config"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -65,22 +66,20 @@ func TestBuildWorkload(t *testing.T) {
 		},
 	}
 
-	location := &networkingv1alpha.Location{
-		Spec: networkingv1alpha.LocationSpec{
-			Provider: networkingv1alpha.LocationProvider{
-				AWS: &networkingv1alpha.AWSLocationProvider{
-					Region: "us-east-1",
-					Zone:   "us-east-1a",
+	testConfig := config.GCPProvider{
+		DownstreamResourceManagement: config.DownstreamResourceManagementConfig{
+			ProviderConfigStrategy: config.ProviderConfigStrategy{
+				Single: config.SingleProviderConfigStrategy{
+					AWSName: "test-aws-config",
 				},
 			},
 		},
 	}
 
-	reconciler := NewWorkloadReconciler().(*workloadReconciler)
+	reconciler := NewWorkloadReconciler(testConfig).(*workloadReconciler)
 
 	reconcileContext := &workloadReconcileContext{
 		providerConfigName: "test-provider",
-		location:           location,
 		workload:           workload,
 	}
 

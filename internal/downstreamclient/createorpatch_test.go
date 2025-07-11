@@ -145,7 +145,7 @@ func TestCreateOrPatch(t *testing.T) {
 				tt.desiredObject,
 				tt.clusterName,
 				tt.parent,
-				tt.callback,
+				nil,
 			)
 
 			if tt.wantErr {
@@ -213,9 +213,7 @@ func TestCreateOrPatch_CallbackError(t *testing.T) {
 		desiredObject,
 		"test-cluster",
 		parent,
-		func(obj *corev1.ConfigMap) error {
-			return assert.AnError
-		},
+		nil,
 	)
 
 	assert.Error(t, err)
