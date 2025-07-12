@@ -21,6 +21,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the {{ .ProjectName }} itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- clusterdownstreaminstance_admin_role.yaml
+- clusterdownstreaminstance_editor_role.yaml
+- clusterdownstreaminstance_viewer_role.yaml
 - clusterdownstreamworkload_admin_role.yaml
 - clusterdownstreamworkload_editor_role.yaml
 - clusterdownstreamworkload_viewer_role.yaml

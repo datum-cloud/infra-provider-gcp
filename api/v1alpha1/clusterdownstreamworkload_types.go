@@ -10,13 +10,7 @@ type ClusterDownstreamWorkloadSpec struct {
 	// WorkloadRef is a reference to the workload that this
 	// downstream workload is associated with.
 	// +kubebuilder:validation:Required
-	WorkloadRef WorkloadRef `json:"workloadRef"`
-}
-
-type WorkloadRef struct {
-	UpstreamClusterName string `json:"upstreamClusterName"`
-	Namespace           string `json:"namespace"`
-	Name                string `json:"name"`
+	UpstreamWorkloadRef UpstreamResourceRef `json:"upstreamWorkloadRef"`
 }
 
 type ClusterDownstreamWorkloadStatus struct {

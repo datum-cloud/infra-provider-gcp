@@ -11,13 +11,7 @@ type ClusterDownstreamWorkloadDeploymentSpec struct {
 	// WorkloadDeploymentRef is a reference to the workload deployment that this
 	// downstream workload deployment is associated with.
 	// +kubebuilder:validation:Required
-	WorkloadDeploymentRef WorkloadDeploymentRef `json:"workloadDeploymentRef"`
-}
-
-type WorkloadDeploymentRef struct {
-	UpstreamClusterName string `json:"upstreamClusterName"`
-	Namespace           string `json:"namespace"`
-	Name                string `json:"name"`
+	UpstreamWorkloadDeploymentRef UpstreamResourceRef `json:"upstreamDeploymentRef"`
 }
 
 type ClusterDownstreamWorkloadDeploymentStatus struct {

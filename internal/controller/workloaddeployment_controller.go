@@ -7,11 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -78,7 +76,9 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 	defer logger.Info("reconcile complete")
 
 	if !workloadDeployment.DeletionTimestamp.IsZero() {
-		// TODO(jreese): Clean up the downstream resources
+		if controllerutil.ContainsFinalizer(&workloadDeployment, gcpInfraFinalizer) {
+			return ctrl.Result{}, r.Finalize(ctx, cl.GetClient(), location, &workloadDeployment)
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -129,10 +129,10 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 				Name: downstreamWorkloadName,
 			},
 			Spec: infrav1alpha1.ClusterDownstreamWorkloadSpec{
-				WorkloadRef: infrav1alpha1.WorkloadRef{
-					UpstreamClusterName: req.ClusterName,
-					Namespace:           workload.Namespace,
-					Name:                workload.Name,
+				UpstreamWorkloadRef: infrav1alpha1.UpstreamResourceRef{
+					ClusterName: req.ClusterName,
+					Namespace:   workload.Namespace,
+					Name:        workload.Name,
 				},
 			},
 		}
@@ -156,10 +156,10 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 				Name: fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
 			},
 			Spec: infrav1alpha1.ClusterDownstreamWorkloadDeploymentSpec{
-				WorkloadDeploymentRef: infrav1alpha1.WorkloadDeploymentRef{
-					UpstreamClusterName: req.ClusterName,
-					Namespace:           workloadDeployment.Namespace,
-					Name:                workloadDeployment.Name,
+				UpstreamWorkloadDeploymentRef: infrav1alpha1.UpstreamResourceRef{
+					ClusterName: req.ClusterName,
+					Namespace:   workloadDeployment.Namespace,
+					Name:        workloadDeployment.Name,
 				},
 			},
 		}
@@ -181,10 +181,10 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 			downstreamStrategy,
 			downstreamClient,
 			req.ClusterName,
-			*location,
-			workload,
-			workloadDeployment,
-			downstreamWorkloadDeployment,
+			location,
+			&workload,
+			&workloadDeployment,
+			&downstreamWorkloadDeployment,
 			aggregatedSecret,
 		)
 		if err != nil {
@@ -194,25 +194,46 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req mcreco
 		}
 	}
 
-	if !apimeta.IsStatusConditionTrue(downstreamWorkload.Status.Conditions, "Ready") {
-		logger.Info("Downstream workload is not yet ready")
-		// TODO(jreese) add a watch
-		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil
+	return ctrl.Result{}, nil
+}
+
+func (r *WorkloadDeploymentReconciler) Finalize(
+	ctx context.Context,
+	upstreamClient client.Client,
+	location *networkingv1alpha.Location,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+) error {
+	var downstreamWorkloadDeployment infrav1alpha1.ClusterDownstreamWorkloadDeployment
+	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKey{
+		Name: fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
+	}, &downstreamWorkloadDeployment); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("failed fetching downstream workload deployment: %w", err)
 	}
 
-	if apimeta.SetStatusCondition(&downstreamWorkloadDeployment.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		ObservedGeneration: downstreamWorkloadDeployment.Generation,
-		Reason:             "Ready",
-		Message:            "Downstream resources have been reconciled",
-	}) {
-		if err := downstreamClient.Status().Update(ctx, &downstreamWorkloadDeployment); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed updating downstream workload status: %w", err)
+	if !downstreamWorkloadDeployment.CreationTimestamp.IsZero() {
+		if location.Spec.Provider.AWS != nil {
+			result, err := r.awsWorkloadDeploymentReconciler.Finalize(
+				ctx,
+				upstreamClient,
+				r.DownstreamCluster,
+				workloadDeployment,
+				&downstreamWorkloadDeployment,
+			)
+			if err != nil {
+				return fmt.Errorf("failed finalizing workload deployment: %w", err)
+			} else if result == providers.FinalizeResultPending {
+				return nil
+			}
 		}
 	}
 
-	return ctrl.Result{}, nil
+	if controllerutil.RemoveFinalizer(workloadDeployment, gcpInfraFinalizer) {
+		if err := upstreamClient.Update(ctx, workloadDeployment); err != nil {
+			return fmt.Errorf("failed to remove finalizer: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

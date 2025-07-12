@@ -9,11 +9,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
+	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 )
 
 const (
 	networkContextControllerNetworkUIDIndex = "networkContextControllerNetworkUIDIndex"
+
+	clusterDownstreamWorkloadIdentifierIndex = "clusterDownstreamWorkloadIdentifierIndex"
 )
 
 func AddIndexers(ctx context.Context, mgr mcmanager.Manager) error {
@@ -39,4 +42,24 @@ func networkContextControllerNetworkUIDIndexFunc(o client.Object) []string {
 	}
 
 	return nil
+}
+
+func AddClusterDownstreamWorkloadIndexers(ctx context.Context, indexer client.FieldIndexer) error {
+	if err := indexer.IndexField(ctx, &infrav1alpha1.ClusterDownstreamWorkload{}, clusterDownstreamWorkloadIdentifierIndex, clusterDownstreamWorkloadIdentifierIndexIndexFunc); err != nil {
+		return fmt.Errorf("failed to add cluster downstream workload indexer %q: %w", clusterDownstreamWorkloadIdentifierIndex, err)
+	}
+
+	return nil
+}
+
+func clusterDownstreamWorkloadIdentifierIndexIndexFunc(o client.Object) []string {
+	obj := o.(*infrav1alpha1.ClusterDownstreamWorkload)
+	return []string{
+		fmt.Sprintf(
+			"%s/%s/%s",
+			obj.Spec.UpstreamWorkloadRef.ClusterName,
+			obj.Spec.UpstreamWorkloadRef.Namespace,
+			obj.Spec.UpstreamWorkloadRef.Name,
+		),
+	}
 }

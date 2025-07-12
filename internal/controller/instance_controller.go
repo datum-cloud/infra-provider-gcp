@@ -3,10 +3,10 @@ package controller
 import (
 	"context"
 	_ "embed"
+	"encoding/base32"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"path"
 	"strconv"
 	"strings"
@@ -14,6 +14,7 @@ import (
 
 	crossplanecommonv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	crossplanemeta "github.com/crossplane/crossplane-runtime/pkg/meta"
+	"github.com/google/uuid"
 	gcpcloudplatformv1beta1 "github.com/upbound/provider-gcp/apis/cloudplatform/v1beta1"
 	gcpcomputev1beta2 "github.com/upbound/provider-gcp/apis/compute/v1beta2"
 	gcpsecretmanagerv1beta1 "github.com/upbound/provider-gcp/apis/secretmanager/v1beta1"
@@ -39,6 +40,7 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/controller/providers"
@@ -104,7 +106,7 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 
 	if !instance.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(&instance, gcpInfraFinalizer) {
-			return ctrl.Result{}, r.Finalize(ctx, cl.GetClient(), &instance)
+			return ctrl.Result{}, r.Finalize(ctx, cl.GetClient(), location, &instance)
 		}
 		return ctrl.Result{}, nil
 	}
@@ -120,6 +122,42 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 	if len(instance.Spec.Controller.SchedulingGates) > 0 {
 		logger.Info("instance has scheduling gates, waiting until they are removed", "scheduling_gates", instance.Spec.Controller.SchedulingGates)
 		return ctrl.Result{}, nil
+	}
+
+	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
+		req.ClusterName,
+		cl.GetClient(),
+		r.DownstreamCluster.GetClient(),
+		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
+	)
+	downstreamClient := downstreamStrategy.GetClient()
+
+	// Ensure that the downstream instance deployment exists. This is used to help
+	// track resources and GC.
+	var downstreamInstance infrav1alpha1.ClusterDownstreamInstance
+	if err := downstreamClient.Get(ctx, client.ObjectKey{
+		Name: fmt.Sprintf("instance-%s", instance.UID),
+	}, &downstreamInstance); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, fmt.Errorf("failed fetching downstream instance: %w", err)
+	}
+
+	if downstreamInstance.CreationTimestamp.IsZero() {
+		downstreamInstance = infrav1alpha1.ClusterDownstreamInstance{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("instance-%s", instance.UID),
+			},
+			Spec: infrav1alpha1.ClusterDownstreamInstanceSpec{
+				UpstreamInstanceRef: infrav1alpha1.UpstreamResourceRef{
+					ClusterName: req.ClusterName,
+					Namespace:   instance.Namespace,
+					Name:        instance.Name,
+				},
+			},
+		}
+
+		if err := downstreamClient.Create(ctx, &downstreamInstance); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed creating downstream instance: %w", err)
+		}
 	}
 
 	workloadDeploymentRef := metav1.GetControllerOf(&instance)
@@ -146,37 +184,32 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 		return ctrl.Result{}, fmt.Errorf("failed fetching workload: %w", err)
 	}
 
-	downstreamStrategy := downstreamclient.NewMappedNamespaceResourceStrategy(
-		req.ClusterName,
-		cl.GetClient(),
-		r.DownstreamCluster.GetClient(),
-		r.Config.DownstreamResourceManagement.ManagedResourceLabels,
-	)
-	downstreamClient := downstreamStrategy.GetClient()
-
 	runtime := instance.Spec.Runtime
 	if runtime.Sandbox != nil {
 		return r.reconcileSandboxRuntimeInstance(
 			ctx,
 			req.ClusterName,
-			*location,
-			cl.GetClient(),
-			downstreamStrategy,
-			downstreamClient,
-			&workload,
-			&workloadDeployment,
-			&instance)
-	} else if runtime.VirtualMachine != nil {
-		return r.reconcileVMRuntimeInstance(
-			ctx,
-			req.ClusterName,
-			*location,
+			location,
 			cl.GetClient(),
 			downstreamStrategy,
 			downstreamClient,
 			&workload,
 			&workloadDeployment,
 			&instance,
+			&downstreamInstance,
+		)
+	} else if runtime.VirtualMachine != nil {
+		return r.reconcileVMRuntimeInstance(
+			ctx,
+			req.ClusterName,
+			location,
+			cl.GetClient(),
+			downstreamStrategy,
+			downstreamClient,
+			&workload,
+			&workloadDeployment,
+			&instance,
+			&downstreamInstance,
 		)
 	}
 
@@ -186,13 +219,14 @@ func (r *InstanceReconciler) Reconcile(ctx context.Context, req mcreconcile.Requ
 func (r *InstanceReconciler) reconcileInstance(
 	ctx context.Context,
 	clusterName string,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
+	downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
 	cloudConfig *cloudinit.CloudConfig,
 	instanceMetadata map[string]*string,
 ) (res ctrl.Result, err error) {
@@ -227,14 +261,18 @@ func (r *InstanceReconciler) reconcileInstance(
 			downstreamClient,
 			clusterName,
 			location,
-			*workload,
-			*workloadDeployment,
-			*instance,
+			workload,
+			workloadDeployment,
+			instance,
+			downstreamInstance,
 			cloudConfig,
 			hasAggregatedSecret,
 			&programmedCondition,
 		)
 	}
+
+	// Remaining code is for GCP, which will be moved into a `proviers.InstanceReconciler`
+	// implementation later.
 
 	if err := r.reconcileNetworkInterfaces(
 		ctx,
@@ -249,10 +287,18 @@ func (r *InstanceReconciler) reconcileInstance(
 		return ctrl.Result{}, fmt.Errorf("failed reconciling network interfaces: %w", err)
 	}
 
-	// Service account names cannot exceed 30 characters
-	// TODO(jreese) move to base36, as the underlying bytes won't be lost
-	h := fnv.New32a()
-	h.Write([]byte(workload.UID))
+	// Service account names must be 6-30 characters long, and match the regular
+	// expression [a-z]([-a-z0-9]*[a-z0-9]) to comply with RFC1035. We base32
+	// encode the workload UUID and prefix it with `w-`, which will not exceed
+	// 28 characters. To meet format requirements, we lowercase the value.
+	u, err := uuid.Parse(string(workload.UID))
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed parsing worklad UID: %w", err)
+	}
+
+	// Base32 encode (no padding), then lowercase.
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
+	gcpServiceAccountName := fmt.Sprintf("w-%s", strings.ToLower(enc.EncodeToString(u[:])))
 
 	// NOTE: This is garbage collected in the workload controller.
 	var serviceAccount gcpcloudplatformv1beta1.ServiceAccount
@@ -281,7 +327,7 @@ func (r *InstanceReconciler) reconcileInstance(
 					downstreamclient.UpstreamOwnerName:        workload.Name,
 					downstreamclient.UpstreamOwnerNamespace:   workload.Namespace,
 					downstreamclient.UpstreamOwnerClusterName: clusterName,
-					crossplanemeta.AnnotationKeyExternalName:  fmt.Sprintf("workload-%d", h.Sum32()),
+					crossplanemeta.AnnotationKeyExternalName:  gcpServiceAccountName,
 				},
 				Labels: map[string]string{
 					computev1alpha.WorkloadUIDLabel: string(workload.UID),
@@ -299,7 +345,7 @@ func (r *InstanceReconciler) reconcileInstance(
 				},
 				ForProvider: gcpcloudplatformv1beta1.ServiceAccountParameters{
 					Project:     ptr.To(location.Spec.Provider.GCP.ProjectID),
-					Description: ptr.To(fmt.Sprintf("service account for workload %s", workload.UID)),
+					Description: ptr.To(fmt.Sprintf("workload %s in cluster %s", workload.UID, clusterName)),
 				},
 			},
 		}
@@ -340,8 +386,9 @@ func (r *InstanceReconciler) reconcileInstance(
 			&programmedCondition,
 			cloudConfig,
 			workload,
+			workloadDeployment,
 			hasAggregatedSecret,
-			serviceAccount,
+			&serviceAccount,
 		)
 		if !proceed || err != nil {
 			return ctrl.Result{}, err
@@ -369,7 +416,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		instance,
 		cloudConfig,
 		instanceMetadata,
-		serviceAccount,
+		&serviceAccount,
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -416,13 +463,14 @@ func (r *InstanceReconciler) reconcileInstance(
 func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
+	downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("processing sandbox based instance")
@@ -611,6 +659,7 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 		workload,
 		workloadDeployment,
 		instance,
+		downstreamInstance,
 		cloudConfig,
 		nil,
 	)
@@ -619,13 +668,14 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 	ctx context.Context,
 	clusterName string,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
+	downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("processing VM based workload")
@@ -696,6 +746,7 @@ func (r *InstanceReconciler) reconcileVMRuntimeInstance(
 		workload,
 		workloadDeployment,
 		instance,
+		downstreamInstance,
 		cloudConfig,
 		instanceMetadata,
 	)
@@ -760,14 +811,15 @@ func (r *InstanceReconciler) hasAggregatedSecret(
 func (r *InstanceReconciler) reconcileGCPSecrets(
 	ctx context.Context,
 	clusterName string,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	programmedCondition *metav1.Condition,
 	cloudConfig *cloudinit.CloudConfig,
 	workload *computev1alpha.Workload,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
 	hasAggregatedSecret bool,
-	serviceAccount gcpcloudplatformv1beta1.ServiceAccount,
+	serviceAccount *gcpcloudplatformv1beta1.ServiceAccount,
 ) (bool, error) {
 	logger := log.FromContext(ctx)
 
@@ -878,7 +930,7 @@ func (r *InstanceReconciler) reconcileGCPSecrets(
 				SecretDataSecretRef: crossplanecommonv1.SecretKeySelector{
 					Key: "secretData",
 					SecretReference: crossplanecommonv1.SecretReference{
-						Name:      fmt.Sprintf("workload-%s", workload.UID),
+						Name:      fmt.Sprintf("workloaddeployment-%s", workloadDeployment.UID),
 						Namespace: downstreamNamespaceName,
 					},
 				},
@@ -974,13 +1026,13 @@ func (r *InstanceReconciler) reconcileGCPInstance(
 	clusterName string,
 	upstreamClient client.Client,
 	downstreamClient client.Client,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
 	instance *computev1alpha.Instance,
 	cloudConfig *cloudinit.CloudConfig,
 	instanceMetadata map[string]*string,
-	serviceAccount gcpcloudplatformv1beta1.ServiceAccount,
+	serviceAccount *gcpcloudplatformv1beta1.ServiceAccount,
 ) (*gcpcomputev1beta2.Instance, error) {
 	logger := log.FromContext(ctx)
 
@@ -1302,7 +1354,7 @@ func (r *InstanceReconciler) buildGCPInstanceNetworkInterfaces(
 func (r *InstanceReconciler) reconcileNetworkInterfaces(
 	ctx context.Context,
 	clusterName string,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	upstreamClient client.Client,
 	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
@@ -1364,7 +1416,7 @@ func (r *InstanceReconciler) reconcileNetworkInterfaces(
 func (r *InstanceReconciler) reconcileNetworkInterfaceNetworkPolicies(
 	ctx context.Context,
 	clusterName string,
-	location networkingv1alpha.Location,
+	location *networkingv1alpha.Location,
 	downstreamClient client.Client,
 	workload *computev1alpha.Workload,
 	workloadDeployment *computev1alpha.WorkloadDeployment,
@@ -1561,43 +1613,64 @@ func (r *InstanceReconciler) syncGCPInstancePowerState(
 func (r *InstanceReconciler) Finalize(
 	ctx context.Context,
 	upstreamClient client.Client,
+	location *networkingv1alpha.Location,
 	instance *computev1alpha.Instance,
 ) error {
-	logger := log.FromContext(ctx)
-	logger.Info("finalizing instance", "instance_name", instance.Name, "finalizers", instance.Finalizers)
+	logger := log.FromContext(ctx).WithValues("instance_name", instance.Name, "finalizers", instance.Finalizers)
+	logger.Info("finalizing instance")
 
-	var gcpInstance gcpcomputev1beta2.Instance
-	gcpInstanceObjectKey := client.ObjectKey{
+	var downstreamInstance infrav1alpha1.ClusterDownstreamInstance
+	if err := r.DownstreamCluster.GetClient().Get(ctx, client.ObjectKey{
 		Name: fmt.Sprintf("instance-%s", instance.UID),
-	}
-	downstreamClient := r.DownstreamCluster.GetClient()
-
-	if err := downstreamClient.Get(ctx, gcpInstanceObjectKey, &gcpInstance); client.IgnoreNotFound(err) != nil {
+	}, &downstreamInstance); client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("failed fetching downstream instance: %w", err)
 	}
 
-	if dt := gcpInstance.DeletionTimestamp; !gcpInstance.CreationTimestamp.IsZero() && dt.IsZero() {
-		if err := downstreamClient.Delete(ctx, &gcpInstance); err != nil {
-			return fmt.Errorf("failed to delete downstream instance: %w", err)
-		}
-	}
+	if !downstreamInstance.CreationTimestamp.IsZero() {
+		if location.Spec.Provider.AWS != nil {
+			result, err := r.awsInstanceReconciler.Finalize(ctx, upstreamClient, r.DownstreamCluster, &downstreamInstance)
+			if err != nil {
+				return fmt.Errorf("failed finalizing instance: %w", err)
+			} else if result == providers.FinalizeResultPending {
+				logger.Info("instance is pending deletion of managed resources")
+				return nil
+			}
+		} else if location.Spec.Provider.GCP != nil {
+			// TODO(jreese) move to provider impl
+			var gcpInstance gcpcomputev1beta2.Instance
+			gcpInstanceObjectKey := client.ObjectKey{
+				Name: fmt.Sprintf("instance-%s", instance.UID),
+			}
+			downstreamClient := r.DownstreamCluster.GetClient()
 
-	logger.Info("gcp instance finalizers", "finalizers", gcpInstance.Finalizers)
+			if err := downstreamClient.Get(ctx, gcpInstanceObjectKey, &gcpInstance); client.IgnoreNotFound(err) != nil {
+				return fmt.Errorf("failed fetching downstream instance: %w", err)
+			}
 
-	// Wait for the instance to be deleted - crossplane doesn't update the
-	// atProvider information or any status conditions when it's successfully
-	// deleted a resource. Observing that the crossplane finalizer has been
-	// removed is the best we've got.
-	if !gcpInstance.CreationTimestamp.IsZero() && controllerutil.ContainsFinalizer(&gcpInstance, crossplaneFinalizer) {
-		logger.Info("downstream instance is being deleted")
-		return r.syncGCPInstancePowerState(ctx, upstreamClient, instance, &gcpInstance)
-	}
+			if dt := gcpInstance.DeletionTimestamp; !gcpInstance.CreationTimestamp.IsZero() && dt.IsZero() {
+				if err := downstreamClient.Delete(ctx, &gcpInstance); err != nil {
+					return fmt.Errorf("failed to delete downstream instance: %w", err)
+				}
+			}
 
-	logger.Info("downstream instance deleted")
+			logger.Info("gcp instance finalizers", "finalizers", gcpInstance.Finalizers)
 
-	if controllerutil.RemoveFinalizer(&gcpInstance, gcpInfraFinalizer) {
-		if err := downstreamClient.Update(ctx, &gcpInstance); err != nil {
-			return fmt.Errorf("failed to remove finalizer: %w", err)
+			// Wait for the instance to be deleted - crossplane doesn't update the
+			// atProvider information or any status conditions when it's successfully
+			// deleted a resource. Observing that the crossplane finalizer has been
+			// removed is the best we've got.
+			if !gcpInstance.CreationTimestamp.IsZero() && controllerutil.ContainsFinalizer(&gcpInstance, crossplaneFinalizer) {
+				logger.Info("downstream instance is being deleted")
+				return r.syncGCPInstancePowerState(ctx, upstreamClient, instance, &gcpInstance)
+			}
+
+			logger.Info("downstream instance deleted")
+
+			if controllerutil.RemoveFinalizer(&gcpInstance, gcpInfraFinalizer) {
+				if err := downstreamClient.Update(ctx, &gcpInstance); err != nil {
+					return fmt.Errorf("failed to remove finalizer: %w", err)
+				}
+			}
 		}
 	}
 

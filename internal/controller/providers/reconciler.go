@@ -28,16 +28,24 @@ type InstanceReconciler interface {
 		downstreamStrategy downstreamclient.ResourceStrategy,
 		downstreamClient client.Client,
 		clusterName string,
-		location networkingv1alpha.Location,
-		workload computev1alpha.Workload,
-		workloadDeployment computev1alpha.WorkloadDeployment,
-		instance computev1alpha.Instance,
+		location *networkingv1alpha.Location,
+		workload *computev1alpha.Workload,
+		workloadDeployment *computev1alpha.WorkloadDeployment,
+		instance *computev1alpha.Instance,
+		downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
 		cloudConfig *cloudinit.CloudConfig,
 		hasAggregatedSecret bool,
 		programmedCondition *metav1.Condition,
 	) (ctrl.Result, error)
 
 	RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error
+
+	Finalize(
+		ctx context.Context,
+		upstreamClient client.Client,
+		downstreamCluster cluster.Cluster,
+		downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
+	) (FinalizeResult, error)
 }
 
 type WorkloadDeploymentReconciler interface {
@@ -47,14 +55,22 @@ type WorkloadDeploymentReconciler interface {
 		downstreamStrategy downstreamclient.ResourceStrategy,
 		downstreamClient client.Client,
 		clusterName string,
-		location networkingv1alpha.Location,
-		workload computev1alpha.Workload,
-		workloadDeployment computev1alpha.WorkloadDeployment,
-		downstreamWorkloadDeployment infrav1alpha1.ClusterDownstreamWorkloadDeployment,
+		location *networkingv1alpha.Location,
+		workload *computev1alpha.Workload,
+		workloadDeployment *computev1alpha.WorkloadDeployment,
+		downstreamWorkloadDeployment *infrav1alpha1.ClusterDownstreamWorkloadDeployment,
 		aggregatedK8sSecret *corev1.Secret,
 	) (ctrl.Result, error)
 
 	RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error
+
+	Finalize(
+		ctx context.Context,
+		upstreamClient client.Client,
+		downstreamCluster cluster.Cluster,
+		workloadDeployment *computev1alpha.WorkloadDeployment,
+		downstreamWorkloadDeployment *infrav1alpha1.ClusterDownstreamWorkloadDeployment,
+	) (FinalizeResult, error)
 }
 
 type WorkloadReconciler interface {
@@ -63,8 +79,32 @@ type WorkloadReconciler interface {
 		downstreamStrategy downstreamclient.ResourceStrategy,
 		downstreamClient client.Client,
 		clusterName string,
-		workload computev1alpha.Workload,
+		workload *computev1alpha.Workload,
+		downstreamWorkload *infrav1alpha1.ClusterDownstreamWorkload,
 	) (ctrl.Result, error)
 
 	RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error
+
+	Finalize(
+		ctx context.Context,
+		upstreamClient client.Client,
+		downstreamCluster cluster.Cluster,
+		workload *computev1alpha.Workload,
+		downstreamWorkload *infrav1alpha1.ClusterDownstreamWorkload,
+	) (FinalizeResult, error)
 }
+
+// FinalizeResult is the action result of a Finalize call.
+type FinalizeResult string
+
+const (
+	// FinalizeResultError means that an error was encountered during
+	FinalizeResultError FinalizeResult = "error"
+
+	// FinalizeResultComplete means that the resource has completed finalizing
+	FinalizeResultComplete FinalizeResult = "complete"
+
+	// FinalizeResultPending means that the resource is not done finalizing and
+	// the finalizer should not be removed.
+	FinalizeResultPending FinalizeResult = "pending"
+)

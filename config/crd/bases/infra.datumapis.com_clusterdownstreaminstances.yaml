@@ -4,24 +4,21 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.1
-  name: clusterdownstreamworkloaddeployments.infra.datumapis.com
+  name: clusterdownstreaminstances.infra.datumapis.com
 spec:
   group: infra.datumapis.com
   names:
-    kind: ClusterDownstreamWorkloadDeployment
-    listKind: ClusterDownstreamWorkloadDeploymentList
-    plural: clusterdownstreamworkloaddeployments
-    singular: clusterdownstreamworkloaddeployment
+    kind: ClusterDownstreamInstance
+    listKind: ClusterDownstreamInstanceList
+    plural: clusterdownstreaminstances
+    singular: clusterdownstreaminstance
   scope: Cluster
   versions:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: |-
-          ClusterDownstreamWorkloadDeployment is used to track and own downstream resources
-          for a given workload deployment. These are cluster scoped resources so that
-          they can own the cluster scoped crossplane resources until Crossplane v2
-          comes out.
+        description: ClusterDownstreamInstance is the Schema for the clusterdownstreaminstances
+          API.
         properties:
           apiVersion:
             description: |-
@@ -41,11 +38,13 @@ spec:
           metadata:
             type: object
           spec:
+            description: ClusterDownstreamInstanceSpec defines the desired state of
+              ClusterDownstreamInstance.
             properties:
-              upstreamDeploymentRef:
+              upstreamInstanceRef:
                 description: |-
-                  WorkloadDeploymentRef is a reference to the workload deployment that this
-                  downstream workload deployment is associated with.
+                  InstanceRef is a reference to the instance that this downstream instance is
+                  associated with.
                 properties:
                   clusterName:
                     description: The name of the cluster which the resource exists
@@ -63,16 +62,11 @@ spec:
                 - name
                 type: object
             required:
-            - upstreamDeploymentRef
+            - upstreamInstanceRef
             type: object
           status:
-            default:
-              conditions:
-              - lastTransitionTime: "1970-01-01T00:00:00Z"
-                message: Waiting for controller
-                reason: Pending
-                status: Unknown
-                type: Ready
+            description: ClusterDownstreamInstanceStatus defines the observed state
+              of ClusterDownstreamInstance.
             properties:
               conditions:
                 items:
@@ -129,55 +123,6 @@ spec:
                   - status
                   - type
                   type: object
-                type: array
-              resourceRefs:
-                description: |-
-                  ResourceRefs is a list of references to downstream resources managed by
-                  the workload deployment.
-                items:
-                  description: ObjectReference contains enough information to let
-                    you inspect or modify the referred object.
-                  properties:
-                    apiVersion:
-                      description: API version of the referent.
-                      type: string
-                    fieldPath:
-                      description: |-
-                        If referring to a piece of an object instead of an entire object, this string
-                        should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
-                        For example, if the object reference is to a container within a pod, this would take on a value like:
-                        "spec.containers{name}" (where "name" refers to the name of the container that triggered
-                        the event) or if no container name is specified "spec.containers[2]" (container with
-                        index 2 in this pod). This syntax is chosen only to have some well-defined way of
-                        referencing a part of an object.
-                      type: string
-                    kind:
-                      description: |-
-                        Kind of the referent.
-                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
-                      type: string
-                    name:
-                      description: |-
-                        Name of the referent.
-                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      type: string
-                    namespace:
-                      description: |-
-                        Namespace of the referent.
-                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
-                      type: string
-                    resourceVersion:
-                      description: |-
-                        Specific resourceVersion to which this reference is made, if any.
-                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
-                      type: string
-                    uid:
-                      description: |-
-                        UID of the referent.
-                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
-                      type: string
-                  type: object
-                  x-kubernetes-map-type: atomic
                 type: array
             type: object
         type: object

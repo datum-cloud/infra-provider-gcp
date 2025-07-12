@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
@@ -56,10 +57,10 @@ func (b *workloadDeploymentReconciler) Reconcile(
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	clusterName string,
-	location networkingv1alpha.Location,
-	workload computev1alpha.Workload,
-	workloadDeployment computev1alpha.WorkloadDeployment,
-	downstreamWorkloadDeployment infrav1alpha1.ClusterDownstreamWorkloadDeployment,
+	location *networkingv1alpha.Location,
+	workload *computev1alpha.Workload,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+	downstreamWorkloadDeployment *infrav1alpha1.ClusterDownstreamWorkloadDeployment,
 	aggregatedK8sSecret *corev1.Secret,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -93,9 +94,9 @@ func (b *workloadDeploymentReconciler) Reconcile(
 
 	reconcileContext := &workloadDeploymentReconcileContext{
 		providerConfigName:  b.config.GetProviderConfigName("AWS", clusterName),
-		location:            &location,
-		workload:            &workload,
-		workloadDeployment:  &workloadDeployment,
+		location:            location,
+		workload:            workload,
+		workloadDeployment:  workloadDeployment,
 		aggregatedK8sSecret: aggregatedK8sSecret,
 		interfaceVPCs:       interfaceVPCs,
 	}
@@ -106,7 +107,10 @@ func (b *workloadDeploymentReconciler) Reconcile(
 	}
 
 	if desiredResources.secretsParameter != nil {
-		result, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, desiredResources.secretsParameter, clusterName, &workloadDeployment, nil)
+		if controllerutil.SetControllerReference(downstreamWorkloadDeployment, desiredResources.secretsParameter, downstreamClient.Scheme()); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set controller owner on ssm parameter: %w", err)
+		}
+		result, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, desiredResources.secretsParameter, clusterName, workloadDeployment, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch ssm parameter %s: %w", desiredResources.secretsParameter.Name, err)
 		}
@@ -115,20 +119,51 @@ func (b *workloadDeploymentReconciler) Reconcile(
 	}
 
 	for _, securityGroup := range desiredResources.securityGroups {
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, &securityGroup, clusterName, &workloadDeployment, nil)
+		if controllerutil.SetControllerReference(downstreamWorkloadDeployment, &securityGroup, downstreamClient.Scheme()); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set controller owner on security group: %w", err)
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, &securityGroup, clusterName, workloadDeployment, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch security group %s: %w", securityGroup.Name, err)
 		}
 	}
 
 	for _, securityGroupRule := range desiredResources.securityGroupRules {
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, &securityGroupRule, clusterName, &workloadDeployment, nil)
+		if controllerutil.SetControllerReference(downstreamWorkloadDeployment, &securityGroupRule, downstreamClient.Scheme()); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set controller owner on security group rule: %w", err)
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, &securityGroupRule, clusterName, workloadDeployment, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch security group rule %s: %w", securityGroupRule.Name, err)
 		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (b *workloadDeploymentReconciler) Finalize(
+	ctx context.Context,
+	upstreamClient client.Client,
+	downstreamCluster cluster.Cluster,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+	downstreamWorkloadDeployment *infrav1alpha1.ClusterDownstreamWorkloadDeployment,
+) (providers.FinalizeResult, error) {
+	logger := log.FromContext(ctx)
+
+	if dt := downstreamWorkloadDeployment.DeletionTimestamp; !dt.IsZero() {
+		// Not done cleaning up owned resources.
+		return providers.FinalizeResultPending, nil
+	}
+
+	logger.Info("deleting downstream workload deployment")
+
+	if err := downstreamCluster.GetClient().Delete(ctx, downstreamWorkloadDeployment, &client.DeleteOptions{
+		PropagationPolicy: ptr.To(metav1.DeletePropagationForeground),
+	}); err != nil {
+		return providers.FinalizeResultError, fmt.Errorf("failed deleting downstream workload deployment: %w", err)
+	}
+
+	return providers.FinalizeResultPending, nil
 }
 
 func (b *workloadDeploymentReconciler) RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error {

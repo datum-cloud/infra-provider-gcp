@@ -17,18 +17,19 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
-	datumsource "go.datum.net/infra-provider-gcp/internal/source"
-
+	infrav1alpha1 "go.datum.net/infra-provider-gcp/api/v1alpha1"
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/controller/providers"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
+	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
 	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
@@ -69,10 +70,11 @@ func (b *instanceReconciler) Reconcile(
 	downstreamStrategy downstreamclient.ResourceStrategy,
 	downstreamClient client.Client,
 	clusterName string,
-	location networkingv1alpha.Location,
-	workload computev1alpha.Workload,
-	workloadDeployment computev1alpha.WorkloadDeployment,
-	instance computev1alpha.Instance,
+	location *networkingv1alpha.Location,
+	workload *computev1alpha.Workload,
+	workloadDeployment *computev1alpha.WorkloadDeployment,
+	instance *computev1alpha.Instance,
+	downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
 	cloudConfig *cloudinit.CloudConfig,
 	hasAggregatedSecret bool,
 	programmedCondition *metav1.Condition,
@@ -159,9 +161,9 @@ func (b *instanceReconciler) Reconcile(
 
 	reconcileContext := &instanceReconcileContext{
 		providerConfigName:  b.config.GetProviderConfigName("AWS", clusterName),
-		location:            &location,
-		workloadDeployment:  &workloadDeployment,
-		instance:            &instance,
+		location:            location,
+		workloadDeployment:  workloadDeployment,
+		instance:            instance,
 		interfaceSubnets:    interfaceSubnets,
 		instanceProfileName: fmt.Sprintf("workload-%s", workload.UID),
 		userData:            userData,
@@ -175,20 +177,29 @@ func (b *instanceReconciler) Reconcile(
 	}
 
 	for _, networkInterface := range desiredResources.networkInterfaces {
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, networkInterface, clusterName, &instance, nil)
+		if controllerutil.SetControllerReference(downstreamInstance, networkInterface, downstreamClient.Scheme()); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set controller owner on network interface: %w", err)
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, networkInterface, clusterName, instance, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch network interface %s: %w", networkInterface.Name, err)
 		}
 	}
 
 	for _, elasticIP := range desiredResources.elasticIPs {
-		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, elasticIP, clusterName, &instance, nil)
+		if controllerutil.SetControllerReference(downstreamInstance, elasticIP, downstreamClient.Scheme()); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set controller owner on elastic IP: %w", err)
+		}
+		_, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, elasticIP, clusterName, instance, nil)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create or patch elastic IP %s: %w", elasticIP.Name, err)
 		}
 	}
 
-	result, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, desiredResources.instance, clusterName, &instance, func(observed, desired *awsec2v1beta1.Instance) error {
+	if controllerutil.SetControllerReference(downstreamInstance, desiredResources.instance, downstreamClient.Scheme()); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to set controller owner on instance: %w", err)
+	}
+	result, err := downstreamclient.CreateOrPatch(ctx, downstreamClient, desiredResources.instance, clusterName, instance, func(observed, desired *awsec2v1beta1.Instance) error {
 		for interfaceIndex, networkInterface := range observed.Spec.ForProvider.NetworkInterface {
 			desired.Spec.ForProvider.NetworkInterface[interfaceIndex].NetworkInterfaceID = networkInterface.NetworkInterfaceID
 		}
@@ -261,7 +272,7 @@ func (b *instanceReconciler) Reconcile(
 	}
 
 	if apimeta.SetStatusCondition(&instance.Status.Conditions, runningCondition) || true {
-		if err := upstreamClient.Status().Update(ctx, &instance); err != nil {
+		if err := upstreamClient.Status().Update(ctx, instance); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update instance status: %w", err)
 		}
 	}
@@ -269,33 +280,73 @@ func (b *instanceReconciler) Reconcile(
 	return ctrl.Result{}, nil
 }
 
+func (b *instanceReconciler) Finalize(
+	ctx context.Context,
+	upstreamClient client.Client,
+	downstreamCluster cluster.Cluster,
+	downstreamInstance *infrav1alpha1.ClusterDownstreamInstance,
+) (providers.FinalizeResult, error) {
+	logger := log.FromContext(ctx)
+
+	if dt := downstreamInstance.DeletionTimestamp; !dt.IsZero() {
+		// Not done cleaning up owned resources.
+		return providers.FinalizeResultPending, nil
+	}
+
+	logger.Info("deleting downstream instance")
+
+	if err := downstreamCluster.GetClient().Delete(ctx, downstreamInstance, &client.DeleteOptions{
+		PropagationPolicy: ptr.To(metav1.DeletePropagationForeground),
+	}); err != nil {
+		return providers.FinalizeResultError, fmt.Errorf("failed deleting downstream instance: %w", err)
+	}
+
+	return providers.FinalizeResultPending, nil
+}
+
 func (b *instanceReconciler) RegisterWatches(downstreamCluster cluster.Cluster, builder *mcbuilder.TypedBuilder[mcreconcile.Request]) error {
-	builder.WatchesRawSource(datumsource.MustNewClusterSource(downstreamCluster, &awsec2v1beta1.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*awsec2v1beta1.Instance, mcreconcile.Request] {
-		return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *awsec2v1beta1.Instance) []mcreconcile.Request {
-			logger := log.FromContext(ctx)
+	builder.
+		WatchesRawSource(datumsource.MustNewClusterSource(downstreamCluster, &awsec2v1beta1.Instance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*awsec2v1beta1.Instance, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, instance *awsec2v1beta1.Instance) []mcreconcile.Request {
+				logger := log.FromContext(ctx)
 
-			upstreamClusterName := instance.Annotations[downstreamclient.UpstreamOwnerClusterName]
-			upstreamName := instance.Annotations[downstreamclient.UpstreamOwnerName]
-			upstreamNamespace := instance.Annotations[downstreamclient.UpstreamOwnerNamespace]
+				upstreamClusterName := instance.Annotations[downstreamclient.UpstreamOwnerClusterName]
+				upstreamName := instance.Annotations[downstreamclient.UpstreamOwnerName]
+				upstreamNamespace := instance.Annotations[downstreamclient.UpstreamOwnerNamespace]
 
-			if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
-				logger.Info("AWS instance is missing upstream ownership metadata")
-				return nil
-			}
+				if upstreamClusterName == "" || upstreamName == "" || upstreamNamespace == "" {
+					logger.Info("AWS instance is missing upstream ownership metadata")
+					return nil
+				}
 
-			return []mcreconcile.Request{
-				{
-					Request: reconcile.Request{
-						NamespacedName: types.NamespacedName{
-							Namespace: upstreamNamespace,
-							Name:      upstreamName,
+				return []mcreconcile.Request{
+					{
+						Request: reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: upstreamNamespace,
+								Name:      upstreamName,
+							},
+						},
+						ClusterName: upstreamClusterName,
+					},
+				}
+			})
+		})).
+		WatchesRawSource(datumsource.MustNewClusterSource(downstreamCluster, &infrav1alpha1.ClusterDownstreamInstance{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*infrav1alpha1.ClusterDownstreamInstance, mcreconcile.Request] {
+			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj *infrav1alpha1.ClusterDownstreamInstance) []mcreconcile.Request {
+				return []mcreconcile.Request{
+					{
+						ClusterName: obj.Spec.UpstreamInstanceRef.ClusterName,
+						Request: reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Namespace: obj.Spec.UpstreamInstanceRef.Namespace,
+								Name:      obj.Spec.UpstreamInstanceRef.Name,
+							},
 						},
 					},
-					ClusterName: upstreamClusterName,
-				},
-			}
-		})
-	}))
+				}
+			})
+		}))
 
 	return nil
 }

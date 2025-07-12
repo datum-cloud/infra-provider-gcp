@@ -248,6 +248,11 @@ func main() {
 
 	// +kubebuilder:scaffold:builder
 
+	if err := controller.AddClusterDownstreamWorkloadIndexers(ctx, downstreamCluster.GetFieldIndexer()); err != nil {
+		setupLog.Error(err, "unable to add indexers to downstream cluster")
+		os.Exit(1)
+	}
+
 	if err = controller.AddIndexers(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to add indexers")
 		os.Exit(1)

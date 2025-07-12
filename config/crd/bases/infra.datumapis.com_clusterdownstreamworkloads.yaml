@@ -41,24 +41,28 @@ spec:
             type: object
           spec:
             properties:
-              workloadRef:
+              upstreamWorkloadRef:
                 description: |-
                   WorkloadRef is a reference to the workload that this
                   downstream workload is associated with.
                 properties:
+                  clusterName:
+                    description: The name of the cluster which the resource exists
+                      in.
+                    type: string
                   name:
+                    description: The name of the referenced resource
                     type: string
                   namespace:
-                    type: string
-                  upstreamClusterName:
+                    description: The namespace in the referenced cluster which the
+                      resource exists in
                     type: string
                 required:
+                - clusterName
                 - name
-                - namespace
-                - upstreamClusterName
                 type: object
             required:
-            - workloadRef
+            - upstreamWorkloadRef
             type: object
           status:
             default:

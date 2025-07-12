@@ -4,6 +4,7 @@
 resources:
 - bases/infra.datumapis.com_clusterdownstreamworkloaddeployments.yaml
 - bases/infra.datumapis.com_clusterdownstreamworkloads.yaml
+- bases/infra.datumapis.com_clusterdownstreaminstances.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
