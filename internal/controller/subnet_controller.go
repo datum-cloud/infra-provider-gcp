@@ -29,8 +29,8 @@ import (
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
-	datumsource "go.datum.net/infra-provider-gcp/internal/source"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
+	milosource "go.miloapis.com/milo/pkg/multicluster-runtime/source"
 )
 
 // SubnetReconciler reconciles Instances and manages their intended state in
@@ -224,7 +224,7 @@ func (r *SubnetReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 
 	return mcbuilder.ControllerManagedBy(mgr).
 		For(&networkingv1alpha.Subnet{}).
-		WatchesRawSource(datumsource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Subnetwork, mcreconcile.Request] {
+		WatchesRawSource(milosource.MustNewClusterSource(r.DownstreamCluster, &gcpcomputev1beta2.Subnetwork{}, func(clusterName string, cl cluster.Cluster) handler.TypedEventHandler[*gcpcomputev1beta2.Subnetwork, mcreconcile.Request] {
 			return handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, subnet *gcpcomputev1beta2.Subnetwork) []mcreconcile.Request {
 				logger := log.FromContext(ctx)
 
