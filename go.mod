@@ -9,7 +9,7 @@ require (
 	github.com/upbound/provider-gcp v1.13.0
 	go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae
 	go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50
-	go.miloapis.com/milo v0.1.0
+	go.miloapis.com/milo v0.2.0
 	golang.org/x/sync v0.15.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.32.1
