@@ -6,7 +6,7 @@ toolchain go1.24.2
 
 require (
 	github.com/crossplane/crossplane-runtime v1.17.0
-	github.com/upbound/provider-gcp v1.13.0
+	github.com/upbound/provider-gcp v1.14.0
 	go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae
 	go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50
 	go.miloapis.com/milo v0.1.0
