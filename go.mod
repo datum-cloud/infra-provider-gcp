@@ -2,7 +2,7 @@ module go.datum.net/infra-provider-gcp
 
 go 1.24.0
 
-toolchain go1.24.2
+toolchain go1.25.1
 
 require (
 	github.com/crossplane/crossplane-runtime v1.17.0
