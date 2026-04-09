@@ -31,6 +31,6 @@
   "mounts": [
     "source=dind-datum-var-lib-docker,target=/var/lib/docker,type=volume",
     "source=${localWorkspaceFolder}/../network-services-operator,target=/workspaces/network-services-operator,type=bind",
-    "source=${localWorkspaceFolder}/../workload-operator,target=/workspaces/workload-operator,type=bind"
+    "source=${localWorkspaceFolder}/../compute,target=/workspaces/compute,type=bind"
   ]
 }

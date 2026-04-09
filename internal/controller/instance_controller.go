@@ -40,13 +40,13 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	computev1alpha "go.datum.net/compute/api/v1alpha"
 	"go.datum.net/infra-provider-gcp/internal/config"
 	"go.datum.net/infra-provider-gcp/internal/controller/cloudinit"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	datumhandler "go.datum.net/infra-provider-gcp/internal/handler"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
 	networkingv1alpha "go.datum.net/network-services-operator/api/v1alpha"
-	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 	milosource "go.miloapis.com/milo/pkg/multicluster-runtime/source"
 )
 
@@ -379,7 +379,7 @@ func (r *InstanceReconciler) reconcileInstance(
 		ObservedTemplateHash: instance.Spec.Controller.TemplateHash,
 	}
 
-	// TODO(jreese) remove when we have workload-operator define these
+	// TODO(jreese) remove when we have compute operator define these
 	if len(instance.Status.NetworkInterfaces) == 0 {
 		instance.Status.NetworkInterfaces = make([]computev1alpha.InstanceNetworkInterfaceStatus, len(gcpInstance.Status.AtProvider.NetworkInterface))
 	}
@@ -1299,7 +1299,7 @@ func (r *InstanceReconciler) buildGCPInstanceNetworkInterfaces(
 		}
 
 		// Fetch the first subnet in the network context
-		// TODO(jreese) have the workload-operator specify the subnet to use
+		// TODO(jreese) have the compute operator specify the subnet to use
 		// in the instance status before the Network gate is removed.
 		var subnet networkingv1alpha.Subnet
 		subnetObjectKey := client.ObjectKey{

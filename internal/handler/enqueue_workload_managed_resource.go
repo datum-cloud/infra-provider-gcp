@@ -13,8 +13,8 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	computev1alpha "go.datum.net/compute/api/v1alpha"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
-	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
 // EnqueueInstancesForWorkloadOwnedDownstreamResource produces a multicluster

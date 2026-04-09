@@ -3,10 +3,10 @@
 This provider manages resources in GCP as a result of interpreting workload and
 network related API entities defined by users.
 
-The primary APIs driving resource creation are defined in [workload-operator][workload-operator]
+The primary APIs driving resource creation are defined in [compute][compute]
 and [network-services-operator][network-services-operator].
 
-[workload-operator]: https://github.com/datum-cloud/workload-operator
+[compute]: https://github.com/datum-cloud/compute
 [network-services-operator]: https://github.com/datum-cloud/network-services-operator
 
 ## Documentation
