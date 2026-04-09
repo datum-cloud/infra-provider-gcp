@@ -99,7 +99,12 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	setupLog.Info("starting infra-provider-gcp", "version", version, "gitCommit", gitCommit, "gitTreeState", gitTreeState, "buildDate", buildDate)
+	setupLog.Info("starting infra-provider-gcp",
+		"version", version,
+		"gitCommit", gitCommit,
+		"gitTreeState", gitTreeState,
+		"buildDate", buildDate,
+	)
 
 	var serverConfig config.GCPProvider
 	var configData []byte
