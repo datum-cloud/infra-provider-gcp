@@ -27,9 +27,9 @@ import (
 
 	"go.datum.net/infra-provider-gcp/internal/config"
 
+	computev1alpha "go.datum.net/compute/api/v1alpha"
 	"go.datum.net/infra-provider-gcp/internal/downstreamclient"
 	"go.datum.net/infra-provider-gcp/internal/locationutil"
-	computev1alpha "go.datum.net/workload-operator/api/v1alpha"
 )
 
 const gcpInfraFinalizer = "compute.datumapis.com/infra-provider-gcp"
