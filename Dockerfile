@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM golang:1.25 AS builder
+FROM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -27,9 +27,7 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
   --mount=type=cache,target="/root/.cache/go-build" \
   CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+FROM scratch
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
