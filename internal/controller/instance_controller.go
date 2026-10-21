@@ -50,7 +50,11 @@ import (
 	milosource "go.miloapis.com/milo/pkg/multicluster-runtime/source"
 )
 
-const crossplaneFinalizer = "finalizer.managedresource.crossplane.io"
+const (
+	crossplaneFinalizer     = "finalizer.managedresource.crossplane.io"
+	writeFileEncodingBase64 = "b64"
+	writeFileOwnerRoot      = "root:root"
+)
 
 var errResourceIsDeleting = errors.New("resource is deleting")
 
@@ -561,9 +565,9 @@ func (r *InstanceReconciler) reconcileSandboxRuntimeInstance(
 	}
 
 	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
-		Encoding:    "b64",
+		Encoding:    writeFileEncodingBase64,
 		Content:     base64.StdEncoding.EncodeToString(podSpecBytes),
-		Owner:       "root:root",
+		Owner:       writeFileOwnerRoot,
 		Path:        "/etc/kubernetes/manifests/instance.yaml",
 		Permissions: "0644",
 	})
@@ -718,9 +722,9 @@ func (r *InstanceReconciler) buildConfigMaps(
 
 		for k, v := range configMap.Data {
 			cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
-				Encoding:    "b64",
+				Encoding:    writeFileEncodingBase64,
 				Content:     base64.StdEncoding.EncodeToString([]byte(v)),
-				Owner:       "root:root",
+				Owner:       writeFileOwnerRoot,
 				Path:        fmt.Sprintf("/etc/configmaps/%s/%s", configMap.Name, k),
 				Permissions: "0644",
 			})
@@ -925,9 +929,9 @@ func (r *InstanceReconciler) reconcileSecrets(
 	logger.Info("downstream secret version processed", "operation_result", result)
 
 	cloudConfig.WriteFiles = append(cloudConfig.WriteFiles, cloudinit.WriteFile{
-		Encoding:    "b64",
+		Encoding:    writeFileEncodingBase64,
 		Content:     base64.StdEncoding.EncodeToString([]byte(populateSecretsScript)),
-		Owner:       "root:root",
+		Owner:       writeFileOwnerRoot,
 		Path:        "/etc/secrets/populate_secrets.py",
 		Permissions: "0755",
 	})
