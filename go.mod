@@ -1,6 +1,6 @@
 module go.datum.net/infra-provider-gcp
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/crossplane/crossplane-runtime v1.17.0
@@ -8,6 +8,7 @@ require (
 	go.datum.net/network-services-operator v0.2.2-0.20250524001505-171de7683bae
 	go.datum.net/workload-operator v0.3.3-0.20250529002934-93284e87ec50
 	go.miloapis.com/milo v0.1.0
+	golang.org/x/crypto/x509roots/fallback v0.0.0-20261020153306-9f2b28d4331a
 	golang.org/x/sync v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.32.1
