@@ -27,8 +27,13 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
   --mount=type=cache,target="/root/.cache/go-build" \
   CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
+RUN echo 'nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin' > /workspace/passwd && \
+  echo 'nonroot:x:65532:' > /workspace/group
+
 FROM scratch
 WORKDIR /
+COPY --from=builder /workspace/passwd /etc/passwd
+COPY --from=builder /workspace/group /etc/group
 COPY --from=builder /workspace/manager .
 USER 65532:65532
 
